@@ -26,4 +26,17 @@ impl PlatformPreview {
     ) -> Result<(), PreviewError> {
         Err(PreviewError::Unsupported)
     }
+
+    pub fn shared_device(
+        &self,
+    ) -> Option<(std::sync::Arc<wgpu::Device>, std::sync::Arc<wgpu::Queue>)> {
+        None
+    }
+
+    pub fn present_texture_view(
+        &mut self,
+        _source: &wgpu::TextureView,
+    ) -> Result<(), PreviewError> {
+        Err(PreviewError::Unsupported)
+    }
 }

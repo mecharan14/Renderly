@@ -10,6 +10,7 @@ import { Tooltip } from "../ui/Tooltip";
 
 export function AudioPanel() {
   const project = useEditorStore((s) => s.project);
+  const mediaAssets = useEditorStore((s) => s.mediaAssets);
   const placeMediaOnTimeline = useEditorStore((s) => s.placeMediaOnTimeline);
   const ensureTrack = useEditorStore((s) => s.ensureTrack);
   const dispatch = useEditorStore((s) => s.dispatch);
@@ -97,7 +98,9 @@ export function AudioPanel() {
           <p className="empty-hint">Import audio or generate a voiceover above.</p>
         </div>
       ) : (
-          items.map((item) => (
+          items.map((item) => {
+            const peaks = mediaAssets[item.id]?.waveform?.peaks;
+            return (
             <div
               key={item.id}
               className="media-item"
@@ -105,9 +108,30 @@ export function AudioPanel() {
               onDragStart={(e) => startMediaDrag(e, item.id, item.kind, item.duration_secs ?? 5)}
               onClick={() => void placeMediaOnTimeline(item.id, item.kind)}
             >
-              <div className="media-thumb audio">
-                <Music size={18} strokeWidth={1.5} />
-              </div>
+              {peaks?.length ? (
+                <div className="media-thumb audio waveform-thumb" aria-hidden>
+                  {(() => {
+                    const bars = 24;
+                    const step = Math.max(1, Math.floor(peaks.length / bars));
+                    const sampled: number[] = [];
+                    for (let i = 0; i < bars; i++) {
+                      let max = 0;
+                      for (let j = 0; j < step && i * step + j < peaks.length; j++) {
+                        max = Math.max(max, Math.abs(peaks[i * step + j] ?? 0));
+                      }
+                      sampled.push(max);
+                    }
+                    const peak = Math.max(0.01, ...sampled);
+                    return sampled.map((v, i) => (
+                      <span key={i} style={{ height: `${Math.max(8, (v / peak) * 100)}%` }} />
+                    ));
+                  })()}
+                </div>
+              ) : (
+                <div className="media-thumb audio">
+                  <Music size={18} strokeWidth={1.5} />
+                </div>
+              )}
               <div className="media-meta">
                 <div className="name">{fileName(item.path)}</div>
                 <div className="sub">{item.duration_secs?.toFixed(1) ?? "?"}s</div>
@@ -118,7 +142,8 @@ export function AudioPanel() {
                 </span>
               </Tooltip>
             </div>
-          ))
+            );
+          })
         )}
       </div>
     </div>

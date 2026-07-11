@@ -29,6 +29,11 @@ bytemuck = { version = "1.25.0", features = ["derive"] }
 tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
 rodio = { version = "0.21", default-features = false, features = ["playback", "wav"] }
+tokio = { version = "1", features = ["net", "sync", "macros", "rt-multi-thread", "time", "io-util"] }
+tokio-tungstenite = "0.26"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+rand = "0.8"
+json-patch = "4"
 
 [target.'cfg(any(windows, target_os = "macos", target_os = "linux"))'.dependencies]
 raw-window-handle = "0.6"

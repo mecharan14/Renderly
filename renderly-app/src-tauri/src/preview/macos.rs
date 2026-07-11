@@ -85,6 +85,17 @@ impl PlatformPreview {
         let gfx = self.gfx.as_mut().ok_or(PreviewError::NotInitialized)?;
         gfx.present_rgba(pixels, width, height)
     }
+
+    pub fn shared_device(
+        &self,
+    ) -> Option<(std::sync::Arc<wgpu::Device>, std::sync::Arc<wgpu::Queue>)> {
+        self.gfx.as_ref().map(|g| g.shared_device())
+    }
+
+    pub fn present_texture_view(&mut self, source: &wgpu::TextureView) -> Result<(), PreviewError> {
+        let gfx = self.gfx.as_mut().ok_or(PreviewError::NotInitialized)?;
+        gfx.present_texture_view(source)
+    }
 }
 
 define_class!(

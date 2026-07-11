@@ -1,9 +1,10 @@
 import { useState } from "react";
-import { Film, Image as ImageIcon, Plus } from "lucide-react";
+import { Film, Music, Plus } from "lucide-react";
 import { useEditorStore, type ThumbnailAsset } from "../../store/editorStore";
 import { fileName } from "../../lib/format";
 import { pickAndImportMedia, importFromPath } from "../../lib/projectFlows";
 import { startMediaDrag } from "../../lib/dragMedia";
+import { assetUrl } from "../../lib/ipc";
 import { Tooltip } from "../ui/Tooltip";
 
 /// Filmstrip thumbnail with hover-scrub: moving the mouse across the card selects which
@@ -37,18 +38,56 @@ function FilmstripThumb({ thumb, durationSecs }: { thumb: ThumbnailAsset; durati
   );
 }
 
+function WaveformThumb({ peaks }: { peaks: number[] }) {
+  // Downsample to a handful of bars for the bin thumbnail.
+  const bars = 24;
+  const step = Math.max(1, Math.floor(peaks.length / bars));
+  const sampled: number[] = [];
+  for (let i = 0; i < bars; i++) {
+    let max = 0;
+    for (let j = 0; j < step && i * step + j < peaks.length; j++) {
+      max = Math.max(max, Math.abs(peaks[i * step + j] ?? 0));
+    }
+    sampled.push(max);
+  }
+  const peak = Math.max(0.01, ...sampled);
+  return (
+    <div className="media-thumb audio waveform-thumb" aria-hidden>
+      {sampled.map((v, i) => (
+        <span key={i} style={{ height: `${Math.max(8, (v / peak) * 100)}%` }} />
+      ))}
+    </div>
+  );
+}
+
+function mediaMetaLine(item: {
+  kind: string;
+  duration_secs?: number | null;
+  width?: number | null;
+  height?: number | null;
+  fps?: number | null;
+}): string {
+  const parts: string[] = [item.kind];
+  if (item.width && item.height) parts.push(`${item.width}×${item.height}`);
+  if (item.fps) parts.push(`${item.fps.toFixed(0)} fps`);
+  if (item.duration_secs != null) parts.push(`${item.duration_secs.toFixed(1)}s`);
+  return parts.join(" · ");
+}
+
 export function MediaPanel() {
   const project = useEditorStore((s) => s.project);
   const mediaAssets = useEditorStore((s) => s.mediaAssets);
   const placeMediaOnTimeline = useEditorStore((s) => s.placeMediaOnTimeline);
   const [dragOver, setDragOver] = useState(false);
 
-  const items = (project?.media ?? []).filter((m) => m.kind !== "audio");
+  // G4: show all asset kinds in the bin (audio used to be filtered out).
+  const items = project?.media ?? [];
+  const emptyProject = items.length === 0;
 
   return (
-    <div className="panel-body">
+    <div className={`panel-body${emptyProject ? " media-import-first" : ""}`}>
       <div
-        className={`drop-zone${dragOver ? " drag-over" : ""}`}
+        className={`drop-zone${dragOver ? " drag-over" : ""}${emptyProject ? " drop-zone-hero" : ""}`}
         onClick={() => void pickAndImportMedia()}
         onDragOver={(e) => {
           e.preventDefault();
@@ -69,11 +108,11 @@ export function MediaPanel() {
           if (path && /[/\\]/.test(path)) void importFromPath(path);
         }}
       >
-        <strong>Drop media here</strong>
-        <span>Video, image, or audio</span>
+        <strong>{emptyProject ? "Import media to start" : "Drop media here"}</strong>
+        <span>Video, image, or audio — click to browse</span>
       </div>
 
-      {items.length === 0 ? (
+      {emptyProject ? (
         <div className="empty-state">
           <div className="empty-state-icon">
             <Film size={28} strokeWidth={1.5} />
@@ -81,11 +120,12 @@ export function MediaPanel() {
           <p>
             <strong>No media yet</strong>
           </p>
-          <p className="empty-hint">Drop a video above or click to browse.</p>
+          <p className="empty-hint">Drop a file above or click the import area to browse.</p>
         </div>
       ) : (
         items.map((item) => {
           const thumb = mediaAssets[item.id]?.thumbnails;
+          const waveform = mediaAssets[item.id]?.waveform;
           const pendingThumb = item.kind === "video" && !thumb;
           return (
             <div
@@ -97,12 +137,23 @@ export function MediaPanel() {
             >
               {thumb && thumb.image ? (
                 <FilmstripThumb thumb={thumb} durationSecs={item.duration_secs ?? 0} />
+              ) : item.kind === "audio" && waveform?.peaks?.length ? (
+                <WaveformThumb peaks={waveform.peaks} />
+              ) : item.kind === "image" ? (
+                <div
+                  className="media-thumb image"
+                  style={{
+                    backgroundImage: `url(${assetUrl(item.path)})`,
+                    backgroundSize: "cover",
+                    backgroundPosition: "center",
+                  }}
+                />
               ) : pendingThumb ? (
                 <div className="media-thumb skeleton" aria-label="Generating thumbnails" />
               ) : (
                 <div className={`media-thumb ${item.kind}`}>
-                  {item.kind === "image" ? (
-                    <ImageIcon size={18} strokeWidth={1.5} />
+                  {item.kind === "audio" ? (
+                    <Music size={18} strokeWidth={1.5} />
                   ) : (
                     <Film size={18} strokeWidth={1.5} />
                   )}
@@ -111,7 +162,7 @@ export function MediaPanel() {
               <div className="media-meta">
                 <div className="name">{fileName(item.path)}</div>
                 <div className="sub">
-                  {item.kind} · {item.duration_secs?.toFixed(1) ?? "?"}s
+                  {mediaMetaLine(item)}
                   {pendingThumb ? " · generating…" : ""}
                 </div>
               </div>

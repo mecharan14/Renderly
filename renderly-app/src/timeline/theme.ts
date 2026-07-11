@@ -19,6 +19,7 @@ export interface TimelineTheme {
   clipAudioWave: string;
   clipCaptionBg: string;
   clipBorderSelected: string;
+  clipShadow: string;
   playhead: string;
   snapGuide: string;
   accent: string;
@@ -40,8 +41,8 @@ export function getTimelineTheme(): TimelineTheme {
     timelineBg: cssVar(styles, "--timeline-bg"),
     rulerBg: cssVar(styles, "--ruler-bg"),
     rulerText: cssVar(styles, "--ruler-text"),
-    rulerLineStrong: "rgba(255,255,255,0.1)",
-    rulerLineWeak: "rgba(255,255,255,0.04)",
+    rulerLineStrong: cssVar(styles, "--ruler-line-strong"),
+    rulerLineWeak: cssVar(styles, "--ruler-line-weak"),
     trackHeaderBg: cssVar(styles, "--track-header-bg"),
     trackLaneBg: cssVar(styles, "--track-lane-bg"),
     text1: cssVar(styles, "--text-1"),
@@ -52,12 +53,13 @@ export function getTimelineTheme(): TimelineTheme {
     clipAudioWave: cssVar(styles, "--clip-audio-wave"),
     clipCaptionBg: cssVar(styles, "--clip-caption-bg"),
     clipBorderSelected: cssVar(styles, "--clip-border-selected"),
+    clipShadow: cssVar(styles, "--clip-shadow"),
     playhead: cssVar(styles, "--playhead"),
     snapGuide: cssVar(styles, "--snap-guide"),
     accent: cssVar(styles, "--accent"),
     border: cssVar(styles, "--border"),
     danger: cssVar(styles, "--danger"),
-    lockedHatch: "rgba(0,0,0,0.35)",
+    lockedHatch: cssVar(styles, "--locked-hatch"),
   };
   return cached;
 }

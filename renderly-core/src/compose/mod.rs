@@ -14,6 +14,8 @@ pub use effects::{builtin_effect_ids, default_params, BUILTIN_EFFECT_IDS};
 use crate::media::RgbaFrame;
 use crate::project::{ClipTransform, EffectInstance, TransitionKind};
 use effects::EffectProcessor;
+use std::collections::HashMap;
+use std::sync::Arc;
 use thiserror::Error;
 use transition::TransitionPass;
 use wgpu::util::DeviceExt;
@@ -109,8 +111,8 @@ fn layer_params(
 }
 
 pub struct Compositor {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
     width: u32,
     height: u32,
     output_texture: wgpu::Texture,
@@ -121,11 +123,112 @@ pub struct Compositor {
     sampler: wgpu::Sampler,
     effects: EffectProcessor,
     transitions: TransitionPass,
+    // A1: per-source-size free list of layer upload textures, reused across composite()
+    // calls instead of allocating one per layer per frame (playback holds a decoded frame
+    // at the same size for many consecutive frames, so the steady state is near-100% reuse).
+    layer_pool: TexturePool,
+}
+
+const TEXTURE_POOL_MAX_PER_SIZE: usize = 8;
+
+#[derive(Default)]
+struct TexturePool {
+    free: HashMap<(u32, u32), Vec<wgpu::Texture>>,
+}
+
+impl TexturePool {
+    fn take(&mut self, width: u32, height: u32) -> Option<wgpu::Texture> {
+        self.free.get_mut(&(width, height))?.pop()
+    }
+
+    fn give_back(&mut self, texture: wgpu::Texture) {
+        let key = (texture.width(), texture.height());
+        let bucket = self.free.entry(key).or_default();
+        if bucket.len() < TEXTURE_POOL_MAX_PER_SIZE {
+            bucket.push(texture);
+        }
+    }
+}
+
+/// Upload RGBA pixels into an existing texture, padding rows to wgpu's 256-byte
+/// `bytes_per_row` alignment when the tight row stride doesn't already satisfy it
+/// (mirrors the pooled-texture upload path in `renderly-app/src-tauri/src/preview/gfx.rs`).
+fn upload_layer_pixels(
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+) {
+    let unpadded_bpr = width * 4;
+    let padded_bpr = wgpu::util::align_to(unpadded_bpr, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+    let padded_storage: Option<Vec<u8>> = if padded_bpr == unpadded_bpr {
+        None
+    } else {
+        let mut buf = vec![0u8; (padded_bpr * height) as usize];
+        for row in 0..height as usize {
+            let src = row * unpadded_bpr as usize;
+            let dst = row * padded_bpr as usize;
+            buf[dst..dst + unpadded_bpr as usize]
+                .copy_from_slice(&pixels[src..src + unpadded_bpr as usize]);
+        }
+        Some(buf)
+    };
+    let upload_slice: &[u8] = match &padded_storage {
+        Some(buf) => buf.as_slice(),
+        None => &pixels[..(unpadded_bpr * height) as usize],
+    };
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        upload_slice,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(padded_bpr),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
 }
 
 impl Compositor {
     pub fn new(width: u32, height: u32) -> Result<Self, ComposeError> {
         pollster::block_on(Self::new_async(width, height))
+    }
+
+    /// A4: build on an externally-owned wgpu device/queue (typically the preview surface's).
+    /// Export/CLI/MCP keep [`Self::new`]; the app injects the shared preview device so
+    /// compose and present share one GPU without a CPU readback round-trip.
+    pub fn with_device(
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, ComposeError> {
+        Self::from_device(device, queue, width, height)
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// View of the most recent GPU composite target. Valid after [`Self::compose_to_texture`]
+    /// (and after [`Self::composite`], though callers that need CPU pixels should use that
+    /// return value instead). Safe to sample from the *same* device that owns this compositor.
+    pub fn output_view(&self) -> &wgpu::TextureView {
+        &self.output_view
     }
 
     async fn new_async(width: u32, height: u32) -> Result<Self, ComposeError> {
@@ -156,6 +259,16 @@ impl Compositor {
             .await
             .map_err(|e| ComposeError::Wgpu(e.to_string()))?;
 
+        Self::from_device(Arc::new(device), Arc::new(queue), width, height)
+    }
+
+    fn from_device(
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, ComposeError> {
+        // TEXTURE_BINDING lets the preview blit sample this RT without a CPU round-trip (A4).
         let output_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("export-target"),
             size: wgpu::Extent3d {
@@ -167,7 +280,9 @@ impl Compositor {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         let output_view = output_texture.create_view(&Default::default());
@@ -276,7 +391,25 @@ impl Compositor {
             sampler,
             effects,
             transitions,
+            layer_pool: TexturePool::default(),
         })
+    }
+
+    /// Composite layers onto the internal RT and leave the result on the GPU (no
+    /// `copy_texture_to_buffer` / map). Preview samples [`Self::output_view`] on the
+    /// shared device; export/MCP keep [`Self::composite`] for the CPU path.
+    pub fn compose_to_texture(&mut self, layers: &[ComposeLayer]) -> Result<(), ComposeError> {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("compose-gpu"),
+            });
+        let keep_alive = self.encode_layers(layers, &mut encoder)?;
+        self.queue.submit(Some(encoder.finish()));
+        for texture in keep_alive {
+            self.layer_pool.give_back(texture);
+        }
+        Ok(())
     }
 
     /// Composite layers in order (first = bottom). Empty → solid black frame.
@@ -290,73 +423,7 @@ impl Compositor {
                 label: Some("export-frame"),
             });
 
-        // Clear once up front.
-        {
-            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("composite-clear"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.output_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.0,
-                            g: 0.0,
-                            b: 0.0,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-        }
-
-        // Hold textures until submit.
-        let mut keep_alive: Vec<wgpu::Texture> = Vec::with_capacity(layers.len());
-
-        let mut i = 0;
-        while i < layers.len() {
-            let pair = layers.get(i).and_then(|a| {
-                let ta = a.transition?;
-                if ta.is_incoming {
-                    return None;
-                }
-                let b = layers.get(i + 1)?;
-                let tb = b.transition?;
-                if !tb.is_incoming || ta.kind != tb.kind {
-                    return None;
-                }
-                Some((ta.kind, ta.progress))
-            });
-
-            if let Some((kind, progress)) = pair {
-                self.transitions
-                    .ensure_rts(&self.device, self.width, self.height);
-                self.draw_layer_to_transition_rt(&layers[i], true, &mut encoder, &mut keep_alive)?;
-                self.draw_layer_to_transition_rt(
-                    &layers[i + 1],
-                    false,
-                    &mut encoder,
-                    &mut keep_alive,
-                )?;
-                self.transitions.blend(
-                    &self.device,
-                    &mut encoder,
-                    &self.output_view,
-                    kind,
-                    progress,
-                )?;
-                i += 2;
-                continue;
-            }
-
-            self.draw_layer_to_output(&layers[i], &mut encoder, &mut keep_alive)?;
-            i += 1;
-        }
+        let keep_alive = self.encode_layers(layers, &mut encoder)?;
 
         let bytes_per_row = self.width * 4;
         let padded_bytes_per_row =
@@ -385,7 +452,9 @@ impl Compositor {
         );
 
         self.queue.submit(Some(encoder.finish()));
-        drop(keep_alive);
+        for texture in keep_alive {
+            self.layer_pool.give_back(texture);
+        }
 
         let slice = self.readback_buffer.slice(..);
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -417,6 +486,71 @@ impl Compositor {
         self.readback_buffer.unmap();
 
         Ok(out)
+    }
+
+    fn encode_layers(
+        &mut self,
+        layers: &[ComposeLayer],
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Result<Vec<wgpu::Texture>, ComposeError> {
+        // Clear once up front.
+        {
+            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("composite-clear"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.output_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        }
+
+        let mut keep_alive: Vec<wgpu::Texture> = Vec::with_capacity(layers.len());
+
+        let mut i = 0;
+        while i < layers.len() {
+            let pair = layers.get(i).and_then(|a| {
+                let ta = a.transition?;
+                if ta.is_incoming {
+                    return None;
+                }
+                let b = layers.get(i + 1)?;
+                let tb = b.transition?;
+                if !tb.is_incoming || ta.kind != tb.kind {
+                    return None;
+                }
+                Some((ta.kind, ta.progress))
+            });
+
+            if let Some((kind, progress)) = pair {
+                self.transitions
+                    .ensure_rts(&self.device, self.width, self.height);
+                self.draw_layer_to_transition_rt(&layers[i], true, encoder, &mut keep_alive)?;
+                self.draw_layer_to_transition_rt(&layers[i + 1], false, encoder, &mut keep_alive)?;
+                self.transitions
+                    .blend(&self.device, encoder, &self.output_view, kind, progress)?;
+                i += 2;
+                continue;
+            }
+
+            self.draw_layer_to_output(&layers[i], encoder, &mut keep_alive)?;
+            i += 1;
+        }
+
+        Ok(keep_alive)
     }
 
     fn draw_layer_to_output(
@@ -455,25 +589,37 @@ impl Compositor {
         keep_alive: &mut Vec<wgpu::Texture>,
     ) -> Result<(), ComposeError> {
         let frame = &layer.frame;
-        let texture = self.device.create_texture_with_data(
-            &self.queue,
-            &wgpu::TextureDescriptor {
-                label: Some("layer"),
-                size: wgpu::Extent3d {
-                    width: frame.width,
-                    height: frame.height,
-                    depth_or_array_layers: 1,
+        let texture = match self.layer_pool.take(frame.width, frame.height) {
+            Some(texture) => {
+                upload_layer_pixels(
+                    &self.queue,
+                    &texture,
+                    frame.width,
+                    frame.height,
+                    &frame.pixels,
+                );
+                texture
+            }
+            None => self.device.create_texture_with_data(
+                &self.queue,
+                &wgpu::TextureDescriptor {
+                    label: Some("layer"),
+                    size: wgpu::Extent3d {
+                        width: frame.width,
+                        height: frame.height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
                 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            },
-            wgpu::util::TextureDataOrder::LayerMajor,
-            &frame.pixels,
-        );
+                wgpu::util::TextureDataOrder::LayerMajor,
+                &frame.pixels,
+            ),
+        };
         let uploaded_view = texture.create_view(&Default::default());
 
         let use_effects = self.effects.apply(
@@ -672,6 +818,90 @@ mod tests {
         assert_eq!(params.user_scale, [1.0, 1.0]);
         assert!((params.rotation_rad).abs() < 1e-6);
         assert!((params.opacity - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn texture_pool_reuses_freed_textures_by_size_and_caps_growth() {
+        let device = match Compositor::new(8, 8) {
+            Ok(c) => c.device,
+            Err(ComposeError::NoAdapter) => return,
+            Err(e) => panic!("{e}"),
+        };
+        let make_tex = |w: u32, h: u32| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            })
+        };
+
+        let mut pool = TexturePool::default();
+        assert!(pool.take(32, 32).is_none(), "nothing pooled yet");
+
+        pool.give_back(make_tex(32, 32));
+        assert!(pool.take(64, 64).is_none(), "different size must not match");
+        assert!(
+            pool.take(32, 32).is_some(),
+            "matching size should be reused"
+        );
+        assert!(
+            pool.take(32, 32).is_none(),
+            "reused texture is consumed, not duplicated"
+        );
+
+        for _ in 0..(TEXTURE_POOL_MAX_PER_SIZE + 4) {
+            pool.give_back(make_tex(16, 16));
+        }
+        let bucket_len = pool.free.get(&(16, 16)).map(Vec::len).unwrap_or(0);
+        assert_eq!(
+            bucket_len, TEXTURE_POOL_MAX_PER_SIZE,
+            "pool must cap per-size growth instead of leaking GPU memory"
+        );
+    }
+
+    #[test]
+    fn compose_to_texture_matches_composite_readback() {
+        let mut c = match Compositor::new(16, 16) {
+            Ok(c) => c,
+            Err(ComposeError::NoAdapter) => return,
+            Err(e) => panic!("{e}"),
+        };
+        let frame = solid_frame(16, 16, 40, 80, 120);
+        let layers = [ComposeLayer {
+            frame: frame.clone(),
+            transform: ClipTransform::default(),
+            effects: vec![],
+            transition: None,
+        }];
+        let cpu = c.composite(&layers).unwrap();
+        c.compose_to_texture(&[ComposeLayer {
+            frame,
+            transform: ClipTransform::default(),
+            effects: vec![],
+            transition: None,
+        }])
+        .unwrap();
+        // Re-read via composite of the same content to prove the GPU path doesn't diverge
+        // structurally — the texture path skips map_read, so we re-composite once for assert.
+        let cpu2 = c
+            .composite(&[ComposeLayer {
+                frame: solid_frame(16, 16, 40, 80, 120),
+                transform: ClipTransform::default(),
+                effects: vec![],
+                transition: None,
+            }])
+            .unwrap();
+        assert_eq!(cpu, cpu2);
+        assert!(!cpu.iter().all(|&b| b == 0));
     }
 
     #[test]

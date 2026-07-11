@@ -17,6 +17,9 @@ export interface ProjectChangedPayload {
   revision: number;
   can_undo: boolean;
   can_redo: boolean;
+  /// Echoes the `mutationId` passed into `applyCommand`/`applyCommands`/`undo`/`redo`, if
+  /// any — lets the listener skip a redundant refetch for edits it already fetched itself.
+  mutation_id?: string | null;
 }
 
 export interface PlaybackTickPayload {
@@ -31,6 +34,15 @@ export interface PlaybackStatePayload {
 
 export interface PlaybackErrorPayload {
   message: string;
+}
+
+/// ~1Hz averaged perf sample from the playback loop (improvement-plan A0 perf HUD).
+export interface PlaybackPerfPayload {
+  decode_ms: number;
+  compose_ms: number;
+  present_ms: number;
+  frame_ms: number;
+  fps: number;
 }
 
 export interface DragDropPayload {
@@ -147,28 +159,101 @@ export function saveProject(): Promise<void> {
   return invoke("save_project");
 }
 
-export function getProject(): Promise<Project> {
-  return invoke<Project>("get_project");
+export function getProject(): Promise<ProjectSnapshot> {
+  return invoke<ProjectSnapshot>("get_project");
+}
+
+export interface ProjectSummary {
+  path: string;
+  name: string;
+  durationSecs: number;
+  modifiedMs: number;
+  width: number;
+  height: number;
+  fps: number;
+  thumbPath?: string | null;
+}
+
+export function listProjects(): Promise<ProjectSummary[]> {
+  return invoke<ProjectSummary[]>("list_projects");
+}
+
+export function renameProject(path: string, newName: string): Promise<void> {
+  return invoke("rename_project", { path, newName });
+}
+
+export function deleteProject(path: string): Promise<void> {
+  return invoke("delete_project", { path });
+}
+
+export function projectThumbnail(path: string): Promise<string | null> {
+  return invoke<string | null>("project_thumbnail", { path });
+}
+
+export function closeProject(): Promise<void> {
+  return invoke("close_project");
 }
 
 // ---- Commands / history ----
 
-export function applyCommand(command: Record<string, unknown>): Promise<string> {
-  return invoke<string>("apply_command", { command });
+/** RFC-6902 operation (matches `json-patch` / `fast-json-patch` wire shape). */
+export type JsonPatchOp = {
+  op: string;
+  path: string;
+  from?: string;
+  value?: unknown;
+};
+
+/** App-IPC result of `apply_command` (B3) — not part of the core Command enum. */
+export interface CommandResult {
+  revision: number;
+  patch: JsonPatchOp[];
+  outcome: string;
+}
+
+export interface CommandsResult {
+  revision: number;
+  patch: JsonPatchOp[];
+  outcomes: string[];
+}
+
+export interface HistoryResult {
+  can_undo: boolean;
+  can_redo: boolean;
+  revision: number;
+  patch: JsonPatchOp[];
+}
+
+export interface ProjectSnapshot {
+  project: Project;
+  revision: number;
+}
+
+/// `mutationId`, if given, comes back on the resulting `project:changed` event so the
+/// caller can recognize "this is my own edit" and skip a second refetch — see B2 in
+/// docs/improvement-plan.md and the `project:changed` handler in `store/editorStore.ts`.
+export function applyCommand(
+  command: Record<string, unknown>,
+  mutationId?: string,
+): Promise<CommandResult> {
+  return invoke<CommandResult>("apply_command", { command, mutationId });
 }
 
 /// Atomic batch — all-or-nothing, one undo step. For gestures that are logically a
 /// single edit but need more than one Command (e.g. auto-track-on-drop).
-export function applyCommands(commands: Record<string, unknown>[]): Promise<string[]> {
-  return invoke<string[]>("apply_commands", { commands });
+export function applyCommands(
+  commands: Record<string, unknown>[],
+  mutationId?: string,
+): Promise<CommandsResult> {
+  return invoke<CommandsResult>("apply_commands", { commands, mutationId });
 }
 
-export function undo(): Promise<HistoryStatus> {
-  return invoke<HistoryStatus>("undo");
+export function undo(mutationId?: string): Promise<HistoryResult> {
+  return invoke<HistoryResult>("undo", { mutationId });
 }
 
-export function redo(): Promise<HistoryStatus> {
-  return invoke<HistoryStatus>("redo");
+export function redo(mutationId?: string): Promise<HistoryResult> {
+  return invoke<HistoryResult>("redo", { mutationId });
 }
 
 // ---- Export ----
@@ -176,8 +261,9 @@ export function redo(): Promise<HistoryStatus> {
 export function exportProject(
   outputPath: string,
   preset: ExportPresetArg | Record<string, unknown>,
+  encode?: { videoEncoder?: string; crf?: number; audioBitrateK?: number },
 ): Promise<void> {
-  return invoke("export_project", { outputPath, preset });
+  return invoke("export_project", { outputPath, preset, encode });
 }
 
 export function cancelExport(): Promise<void> {
@@ -220,8 +306,26 @@ export function pause(): Promise<number> {
   return invoke<number>("pause");
 }
 
+/** Mirror timeline selection into the Rust backend for bridge `get_editor_status`. */
+export function setEditorSelection(
+  selection: {
+    primary: { trackId: string; clipId: string } | null;
+    all: { trackId: string; clipId: string }[];
+  } | null,
+): Promise<void> {
+  return invoke("set_editor_selection", { selection });
+}
+
 export function seek(timeSecs: number): Promise<void> {
   return invoke("seek", { timeSecs });
+}
+
+/// Refresh the preview after an edit (apply_command/apply_commands/undo/redo) without the
+/// disruption of a real seek. While playing, this live-swaps the project into the running
+/// play session (no pause, no audio restart, no decoder respawn); while paused, it renders
+/// one frame at `timeSecs` — see the Rust `refresh_frame` command's doc comment.
+export function refreshFrame(timeSecs: number): Promise<void> {
+  return invoke("refresh_frame", { timeSecs });
 }
 
 export function scrubAudio(timeSecs: number): Promise<void> {
@@ -272,6 +376,17 @@ export function onPlaybackState(cb: (payload: PlaybackStatePayload) => void): ()
 
 export function onPlaybackError(cb: (payload: PlaybackErrorPayload) => void): () => void {
   const unlisten = listen<PlaybackErrorPayload>("playback:error", (e) => cb(e.payload));
+  return () => void unlisten.then((f) => f());
+}
+
+export function onPlaybackPerf(cb: (payload: PlaybackPerfPayload) => void): () => void {
+  const unlisten = listen<PlaybackPerfPayload>("playback:perf", (e) => cb(e.payload));
+  return () => void unlisten.then((f) => f());
+}
+
+/** E3: agent `set_playhead` over the live bridge — sync GUI playhead. */
+export function onBridgePlayhead(cb: (payload: { time_secs: number }) => void): () => void {
+  const unlisten = listen<{ time_secs: number }>("bridge:playhead", (e) => cb(e.payload));
   return () => void unlisten.then((f) => f());
 }
 

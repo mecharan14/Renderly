@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { applyPatch, type Operation } from "fast-json-patch";
 import * as ipc from "../lib/ipc";
 import { addCaption, addClip, addTrack } from "../lib/commands";
 import { timelineDuration, TRACK_LABEL_W, maxScrollX, maxScrollY, clipLeft } from "../timeline/layout";
@@ -32,6 +33,37 @@ export interface ToastItem {
 }
 
 let nextToastId = 1;
+
+/// Mutation ids this tab has issued to the backend but hasn't finished applying yet.
+/// `dispatch`/`dispatchBatch`/`undo`/`redo` apply the returned JSON Patch themselves;
+/// the `project:changed` listener (wired in `connectStoreToBackendEvents`) checks this
+/// set and skips its refetch when it sees one of these ids echoed back — otherwise every
+/// edit did a redundant full `get_project` (B2). Anything else (a different id, or none)
+/// means some other writer changed the project — MCP, another window — and must still
+/// trigger the listener's refetch. Plain module-level `Set`, not store state.
+const selfMutationIds = new Set<string>();
+
+/// Apply an RFC-6902 patch from a mutation result onto the current store project.
+/// Returns false (and leaves state untouched) on failure so the caller can fall back to
+/// a full `refetchProject`.
+function applyProjectPatch(
+  get: () => EditorStore,
+  set: (partial: Partial<EditorStore>) => void,
+  revision: number,
+  patch: ipc.JsonPatchOp[],
+): boolean {
+  const current = get().project;
+  if (!current) return false;
+  try {
+    const clone = structuredClone(current) as Project;
+    applyPatch(clone as object, patch as Operation[], true, false);
+    set({ project: clone, clientRevision: revision });
+    return true;
+  } catch (e) {
+    console.warn("apply project patch failed; falling back to full fetch:", e);
+    return false;
+  }
+}
 
 export interface ThumbnailAsset {
   stripUrl: string;
@@ -70,12 +102,17 @@ export interface DragGhost {
   valid: boolean;
 }
 
-interface EditorStore {
+export interface EditorStore {
   project: Project | null;
   projectPath: string | null;
+  /// B3: last applied revision from get_project / patch responses.
+  clientRevision: number;
   playhead: number;
   playing: boolean;
+  /** Primary (focused) selection — inspector / trim handles. */
   selection: Selection | null;
+  /** All selected clips including primary (`selections[0]` === selection when non-empty). */
+  selections: Selection[];
   toolMode: ToolMode;
   snapEnabled: boolean;
   pxPerSec: number;
@@ -88,7 +125,7 @@ interface EditorStore {
   canRedo: boolean;
   toasts: ToastItem[];
   importBusy: boolean;
-  clipboard: { clip: Clip; trackKind: TrackKind } | null;
+  clipboard: { items: { clip: Clip; trackKind: TrackKind }[] } | null;
   dragGhost: DragGhost | null;
   contextMenu: { x: number; y: number; trackId: string; clipId: string; atSecs: number } | null;
   snapGuideSecs: number | null;
@@ -104,10 +141,23 @@ interface EditorStore {
   /// ready` / `media:waveform-ready` events (fired automatically by the backend on
   /// import and on project open — nothing here triggers generation itself).
   mediaAssets: Record<string, MediaAssetEntry>;
+  /// Latest ~1Hz averaged sample from the playback loop's perf HUD (A0), `null` before
+  /// the first sample arrives or once playback stops. `perfHudVisible` is a display
+  /// toggle (Ctrl+Shift+P) independent of whether a sample has arrived yet.
+  perfSample: ipc.PlaybackPerfPayload | null;
+  perfHudVisible: boolean;
+  /// Bumped when the UI theme cycles so canvas consumers (TimelineCanvas) re-read
+  /// `getTimelineTheme()` after `resetTimelineThemeCache()` (D2).
+  themeEpoch: number;
+  /// G2: auto-save status for the TopBar indicator. Backend already persists on every
+  /// edit via `commit_project`; this just mirrors that honesty to the UI.
+  saveStatus: "saved" | "saving" | null;
 
   toast(message: string, kind?: ToastKind): void;
   dismissToast(id: number): void;
   select(sel: Selection | null): void;
+  toggleSelect(sel: Selection): void;
+  setSelections(sels: Selection[]): void;
   setTool(tool: ToolMode): void;
   setSnap(enabled: boolean): void;
   setZoom(px: number): void;
@@ -131,6 +181,7 @@ interface EditorStore {
   quickStart(): Promise<boolean>;
   createNewProject(path: string, name: string): Promise<void>;
   saveProject(): Promise<void>;
+  closeProject(): Promise<void>;
   dispatch(command: Record<string, unknown>, quiet?: boolean): Promise<boolean>;
   dispatchBatch(commands: Record<string, unknown>[], quiet?: boolean): Promise<boolean>;
   undo(): Promise<void>;
@@ -153,14 +204,19 @@ interface EditorStore {
 
   onPlaybackTick(payload: { time_secs: number; playing: boolean }): void;
   onPlaybackState(payload: { playing: boolean; time_secs: number }): void;
+  onPlaybackPerf(payload: ipc.PlaybackPerfPayload): void;
+  togglePerfHud(): void;
+  bumpThemeEpoch(): void;
 }
 
 export const useEditorStore = create<EditorStore>((set, get) => ({
   project: null,
   projectPath: null,
+  clientRevision: 0,
   playhead: 0,
   playing: false,
   selection: null,
+  selections: [],
   toolMode: "select",
   snapEnabled: true,
   pxPerSec: 80,
@@ -177,6 +233,10 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   snapGuideSecs: null,
   isDragging: false,
   mediaAssets: {},
+  perfSample: null,
+  perfHudVisible: false,
+  themeEpoch: 0,
+  saveStatus: null,
 
   toast(message, kind = "info") {
     const id = nextToastId++;
@@ -188,7 +248,36 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   },
 
   select(sel) {
-    set({ selection: sel });
+    const selections = sel ? [sel] : [];
+    set({ selection: sel, selections });
+    void ipc.setEditorSelection(sel ? { primary: sel, all: selections } : null);
+  },
+  toggleSelect(sel) {
+    const { selections, project } = get();
+    const idx = selections.findIndex((s) => s.trackId === sel.trackId && s.clipId === sel.clipId);
+    let next: Selection[];
+    if (idx >= 0) {
+      next = selections.filter((_, i) => i !== idx);
+    } else if (selections.length > 0 && project) {
+      // Prefer same kind across tracks; different kind replaces the selection.
+      const primaryTrack = project.tracks.find((t) => t.id === selections[0]!.trackId);
+      const newTrack = project.tracks.find((t) => t.id === sel.trackId);
+      if (primaryTrack && newTrack && primaryTrack.kind !== newTrack.kind) {
+        next = [sel];
+      } else {
+        next = [...selections, sel];
+      }
+    } else {
+      next = [...selections, sel];
+    }
+    const primary = next[0] ?? null;
+    set({ selection: primary, selections: next });
+    void ipc.setEditorSelection(primary ? { primary, all: next } : null);
+  },
+  setSelections(sels) {
+    const primary = sels[0] ?? null;
+    set({ selection: primary, selections: sels });
+    void ipc.setEditorSelection(primary ? { primary, all: sels } : null);
   },
   setTool(tool) {
     set({ toolMode: tool });
@@ -300,7 +389,25 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     set({ dragGhost: ghost });
   },
   openContextMenu(x, y, trackId, clipId, atSecs) {
-    set({ contextMenu: { x, y, trackId, clipId, atSecs }, selection: { trackId, clipId } });
+    const sel = { trackId, clipId };
+    const { selections } = get();
+    const already =
+      selections.length > 1 &&
+      selections.some((s) => s.trackId === trackId && s.clipId === clipId);
+    if (already) {
+      // Keep multi-selection; promote the right-clicked clip to primary.
+      const rest = selections.filter((s) => !(s.trackId === trackId && s.clipId === clipId));
+      const next = [sel, ...rest];
+      set({ contextMenu: { x, y, trackId, clipId, atSecs }, selection: sel, selections: next });
+      void ipc.setEditorSelection({ primary: sel, all: next });
+    } else {
+      set({
+        contextMenu: { x, y, trackId, clipId, atSecs },
+        selection: sel,
+        selections: [sel],
+      });
+      void ipc.setEditorSelection({ primary: sel, all: [sel] });
+    }
   },
   closeContextMenu() {
     set({ contextMenu: null });
@@ -341,8 +448,8 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   async refetchProject() {
     if (!get().projectPath) return;
     try {
-      const project = await ipc.getProject();
-      set({ project });
+      const snap = await ipc.getProject();
+      set({ project: snap.project, clientRevision: snap.revision });
     } catch (e) {
       console.warn("refetch project:", e);
     }
@@ -351,16 +458,19 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   async loadProjectFromPath(path) {
     try {
       await ipc.openProject(path);
-      const project = await ipc.getProject();
+      const snap = await ipc.getProject();
       set({
-        project,
+        project: snap.project,
+        clientRevision: snap.revision,
         projectPath: path,
         playhead: 0,
         selection: null,
+        selections: [],
         canUndo: false,
         canRedo: false,
         mediaAssets: {},
       });
+      void ipc.setEditorSelection(null);
     } catch (e) {
       get().toast(`Load project failed: ${errMsg(e)}`, "error");
     }
@@ -373,6 +483,8 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       const path = await ipc.quickStartProject();
       await get().loadProjectFromPath(path);
       await get().ensureStarterTracks(true);
+      // G3: land on the media bin so the import-forward empty state is front and center.
+      set({ leftTab: "media", saveStatus: "saved" });
       return true;
     } catch (e) {
       get().toast(`Could not start project: ${errMsg(e)}`, "error");
@@ -386,15 +498,41 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     await ipc.newProject(path, name);
     await get().loadProjectFromPath(path);
     await get().ensureStarterTracks(true);
+    set({ leftTab: "media", saveStatus: "saved" });
   },
 
   async saveProject() {
     if (!get().projectPath) return;
+    set({ saveStatus: "saving" });
     try {
       await ipc.saveProject();
-      get().toast("Project saved", "success");
+      set({ saveStatus: "saved" });
     } catch (e) {
+      set({ saveStatus: null });
       get().toast(`Save failed: ${errMsg(e)}`, "error");
+    }
+  },
+
+  async closeProject() {
+    try {
+      get().stopPlayback();
+      await ipc.closeProject();
+      set({
+        project: null,
+        projectPath: null,
+        clientRevision: 0,
+        playhead: 0,
+        playing: false,
+        selection: null,
+        selections: [],
+        canUndo: false,
+        canRedo: false,
+        mediaAssets: {},
+        saveStatus: null,
+        clipboard: null,
+      });
+    } catch (e) {
+      get().toast(`Close failed: ${errMsg(e)}`, "error");
     }
   },
 
@@ -403,12 +541,18 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       get().toast("Create or open a project first.", "error");
       return false;
     }
-    // CapCut-style: pause before mutating so decoders/audio don't race the edit.
-    if (get().playing) get().stopPlayback();
+    // No unconditional pause/seek here (that was BX1: every inspector tweak or drag
+    // commit forced a pause + reseek + audio restart mid-playback). `refreshFrame`
+    // live-swaps the edited project into the running play session when playing, or
+    // renders one paused-state frame otherwise — see its doc comment in `lib/ipc.ts`.
+    const mutationId = crypto.randomUUID();
+    selfMutationIds.add(mutationId);
     try {
-      await ipc.applyCommand(command);
-      await get().refetchProject();
-      await ipc.seek(get().playhead).catch(() => {});
+      const result = await ipc.applyCommand(command, mutationId);
+      if (!applyProjectPatch(get, set, result.revision, result.patch)) {
+        await get().refetchProject();
+      }
+      await ipc.refreshFrame(get().playhead).catch(() => {});
       return true;
     } catch (e) {
       if (!quiet) get().toast(formatCommandError(e), "error");
@@ -418,6 +562,8 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       // edit visible until some unrelated later command happens to refetch.
       await get().refetchProject();
       return false;
+    } finally {
+      selfMutationIds.delete(mutationId);
     }
   },
 
@@ -426,89 +572,132 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       get().toast("Create or open a project first.", "error");
       return false;
     }
-    if (get().playing) get().stopPlayback();
+    const mutationId = crypto.randomUUID();
+    selfMutationIds.add(mutationId);
     try {
-      await ipc.applyCommands(commands);
-      await get().refetchProject();
-      await ipc.seek(get().playhead).catch(() => {});
+      const result = await ipc.applyCommands(commands, mutationId);
+      if (!applyProjectPatch(get, set, result.revision, result.patch)) {
+        await get().refetchProject();
+      }
+      await ipc.refreshFrame(get().playhead).catch(() => {});
       return true;
     } catch (e) {
       if (!quiet) get().toast(formatCommandError(e), "error");
       await get().refetchProject();
       return false;
+    } finally {
+      selfMutationIds.delete(mutationId);
     }
   },
 
   async undo() {
-    if (get().playing) get().stopPlayback();
+    const mutationId = crypto.randomUUID();
+    selfMutationIds.add(mutationId);
     try {
-      const status = await ipc.undo();
+      const status = await ipc.undo(mutationId);
       set({ canUndo: status.can_undo, canRedo: status.can_redo });
-      await get().refetchProject();
+      if (status.patch.length > 0) {
+        if (!applyProjectPatch(get, set, status.revision, status.patch)) {
+          await get().refetchProject();
+        }
+      } else {
+        set({ clientRevision: status.revision });
+      }
       get().pruneStaleSelection();
-      await ipc.seek(get().playhead).catch(() => {});
+      await ipc.refreshFrame(get().playhead).catch(() => {});
     } catch (e) {
       get().toast(formatCommandError(e, "Undo failed"), "error");
+    } finally {
+      selfMutationIds.delete(mutationId);
     }
   },
 
   async redo() {
-    if (get().playing) get().stopPlayback();
+    const mutationId = crypto.randomUUID();
+    selfMutationIds.add(mutationId);
     try {
-      const status = await ipc.redo();
+      const status = await ipc.redo(mutationId);
       set({ canUndo: status.can_undo, canRedo: status.can_redo });
-      await get().refetchProject();
+      if (status.patch.length > 0) {
+        if (!applyProjectPatch(get, set, status.revision, status.patch)) {
+          await get().refetchProject();
+        }
+      } else {
+        set({ clientRevision: status.revision });
+      }
       get().pruneStaleSelection();
-      await ipc.seek(get().playhead).catch(() => {});
+      await ipc.refreshFrame(get().playhead).catch(() => {});
     } catch (e) {
       get().toast(formatCommandError(e, "Redo failed"), "error");
+    } finally {
+      selfMutationIds.delete(mutationId);
     }
   },
 
   pruneStaleSelection() {
-    // Undo/redo can restore a project where the selected clip no longer exists (its
-    // creation was undone, or a redo removed it again). Consumers mostly guard with
-    // optional chaining, but `splitSelectedAtPlayhead` doesn't — it would otherwise
-    // repeatedly dispatch SplitClip against a dead clip id, failing every time with a
-    // confusing toast and no visual cue that the selection is gone.
-    const { project, selection } = get();
-    if (!project || !selection) return;
-    const track = project.tracks.find((t) => t.id === selection.trackId);
-    const clip = track?.clips.find((c) => c.id === selection.clipId);
-    if (!track || !clip) set({ selection: null });
+    // Undo/redo can restore a project where selected clips no longer exist.
+    const { project, selections } = get();
+    if (!project) return;
+    if (selections.length === 0) return;
+    const next = selections.filter((sel) => {
+      const track = project.tracks.find((t) => t.id === sel.trackId);
+      return !!track?.clips.find((c) => c.id === sel.clipId);
+    });
+    if (next.length === selections.length) return;
+    const primary = next[0] ?? null;
+    set({ selection: primary, selections: next });
+    void ipc.setEditorSelection(primary ? { primary, all: next } : null);
   },
 
   copySelection() {
-    const { project, selection } = get();
-    if (!project || !selection) return;
-    const track = project.tracks.find((t) => t.id === selection.trackId);
-    const clip = track?.clips.find((c) => c.id === selection.clipId);
-    if (!track || !clip) return;
-    set({ clipboard: { clip, trackKind: track.kind } });
-    get().toast("Copied", "info");
+    const { project, selections } = get();
+    if (!project || selections.length === 0) return;
+    const items: { clip: Clip; trackKind: TrackKind }[] = [];
+    for (const sel of selections) {
+      const track = project.tracks.find((t) => t.id === sel.trackId);
+      const clip = track?.clips.find((c) => c.id === sel.clipId);
+      if (track && clip) items.push({ clip, trackKind: track.kind });
+    }
+    if (items.length === 0) return;
+    set({ clipboard: { items } });
+    get().toast(items.length === 1 ? "Copied" : `Copied ${items.length} clips`, "info");
   },
 
   async pasteAtPlayhead() {
     const { project, clipboard, playhead } = get();
-    if (!project || !clipboard) return;
-    const track =
-      (get().selection && project.tracks.find((t) => t.id === get().selection!.trackId)?.kind === clipboard.trackKind
-        ? project.tracks.find((t) => t.id === get().selection!.trackId)
-        : undefined) ?? project.tracks.find((t) => t.kind === clipboard.trackKind);
-    if (!track) {
-      get().toast(`No ${clipboard.trackKind} track to paste onto`, "error");
-      return;
+    if (!project || !clipboard || clipboard.items.length === 0) return;
+    const anchor = Math.min(...clipboard.items.map((i) => i.clip.position_secs));
+    const commands: Record<string, unknown>[] = [];
+    for (const item of clipboard.items) {
+      const track =
+        (get().selection &&
+        project.tracks.find((t) => t.id === get().selection!.trackId)?.kind === item.trackKind
+          ? project.tracks.find((t) => t.id === get().selection!.trackId)
+          : undefined) ?? project.tracks.find((t) => t.kind === item.trackKind);
+      if (!track) {
+        get().toast(`No ${item.trackKind} track to paste onto`, "error");
+        return;
+      }
+      const pos = playhead + (item.clip.position_secs - anchor);
+      commands.push(pasteCommand(item.clip, track.id, Math.max(0, pos)));
     }
-    await get().dispatch(pasteCommand(clipboard.clip, track.id, playhead));
+    if (commands.length === 1) await get().dispatch(commands[0]!);
+    else await get().dispatchBatch(commands);
   },
 
   async duplicateSelection() {
-    const { project, selection } = get();
-    if (!project || !selection) return;
-    const track = project.tracks.find((t) => t.id === selection.trackId);
-    const clip = track?.clips.find((c) => c.id === selection.clipId);
-    if (!track || !clip) return;
-    await get().dispatch(pasteCommand(clip, track.id, clip.position_secs + clipDurationSecs(clip)));
+    const { project, selections } = get();
+    if (!project || selections.length === 0) return;
+    const commands: Record<string, unknown>[] = [];
+    for (const sel of selections) {
+      const track = project.tracks.find((t) => t.id === sel.trackId);
+      const clip = track?.clips.find((c) => c.id === sel.clipId);
+      if (!track || !clip) continue;
+      commands.push(pasteCommand(clip, track.id, clip.position_secs + clipDurationSecs(clip)));
+    }
+    if (commands.length === 0) return;
+    if (commands.length === 1) await get().dispatch(commands[0]!);
+    else await get().dispatchBatch(commands);
   },
 
   async ensureStarterTracks(quiet = false) {
@@ -621,7 +810,22 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     get().ensurePlayheadVisible();
   },
   onPlaybackState(payload) {
-    set({ playing: payload.playing, playhead: payload.time_secs });
+    set({
+      playing: payload.playing,
+      playhead: payload.time_secs,
+      // Perf samples are only meaningful mid-playback — clear on stop so the HUD doesn't
+      // keep showing a frozen last-second-of-playback reading forever while paused.
+      perfSample: payload.playing ? get().perfSample : null,
+    });
+  },
+  onPlaybackPerf(payload) {
+    set({ perfSample: payload });
+  },
+  togglePerfHud() {
+    set((s) => ({ perfHudVisible: !s.perfHudVisible }));
+  },
+  bumpThemeEpoch() {
+    set((s) => ({ themeEpoch: s.themeEpoch + 1 }));
   },
 }));
 
@@ -665,14 +869,28 @@ export function connectStoreToBackendEvents(): () => void {
     useEditorStore.getState().toast(p.message, "error");
   });
   const unsubChanged = ipc.onProjectChanged((p) => {
-    useEditorStore.setState({ canUndo: p.can_undo, canRedo: p.can_redo });
+    useEditorStore.setState({
+      canUndo: p.can_undo,
+      canRedo: p.can_redo,
+      // G2: every successful edit already hit disk via backend `commit_project`.
+      saveStatus: "saved",
+    });
     // Skip the refetch while a timeline drag is in progress — see `isDragging`'s doc
     // comment. The undo/redo flags above are harmless to update regardless.
     if (useEditorStore.getState().isDragging) return;
+    // B2: skip for edits this tab already applied via the mutation response patch.
+    if (p.mutation_id && selfMutationIds.has(p.mutation_id)) return;
+    // B3: already at this revision (e.g. duplicate event) — nothing to do.
+    if (p.revision === useEditorStore.getState().clientRevision) return;
+    // External edit (or revision gap) — events don't carry the patch, so full refetch.
     void useEditorStore.getState().refetchProject();
   });
   const unsubThumbs = ipc.onThumbnailsReady((p) => useEditorStore.getState().onThumbnailsReady(p));
   const unsubWaveform = ipc.onWaveformReady((p) => useEditorStore.getState().onWaveformReady(p));
+  const unsubPerf = ipc.onPlaybackPerf((p) => useEditorStore.getState().onPlaybackPerf(p));
+  const unsubBridgePlayhead = ipc.onBridgePlayhead((p) => {
+    void useEditorStore.getState().seekTo(p.time_secs);
+  });
   return () => {
     unsubTick();
     unsubState();
@@ -680,5 +898,7 @@ export function connectStoreToBackendEvents(): () => void {
     unsubChanged();
     unsubThumbs();
     unsubWaveform();
+    unsubPerf();
+    unsubBridgePlayhead();
   };
 }

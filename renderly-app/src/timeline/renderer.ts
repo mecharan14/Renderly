@@ -12,6 +12,8 @@ export interface TimelineRenderState {
   project: Project | null;
   playheadSecs: number;
   selection: Selection | null;
+  /** C3: all selected clips (borders drawn for each). Falls back to `[selection]`. */
+  selections?: Selection[];
   pxPerSec: number;
   scrollX?: number;
   scrollY?: number;
@@ -191,33 +193,115 @@ function drawDragGhost(
   ctx.restore();
 }
 
+/// Resizes the backing bitmap only when the CSS size actually changed — assigning
+/// `canvas.width`/`.height` (even to their current value) forces the browser to discard
+/// and reallocate the bitmap, which is wasteful when this runs ~30x/sec during playback
+/// (the playhead used to live on this same canvas — see `renderTimelineOverlay` below for
+/// where it moved). Always re-applies the DPR transform, which is cheap and must track
+/// the caller's current `dpr` even when the size didn't change.
+function syncCanvasSize(
+  canvas: HTMLCanvasElement,
+  ctx: CanvasRenderingContext2D,
+  dpr: number,
+): { w: number; h: number } {
+  const rect = canvas.getBoundingClientRect();
+  const targetW = Math.round(rect.width * dpr);
+  const targetH = Math.round(rect.height * dpr);
+  if (canvas.width !== targetW || canvas.height !== targetH) {
+    canvas.width = targetW;
+    canvas.height = targetH;
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { w: rect.width, h: rect.height };
+}
+
+export interface TimelineOverlayState {
+  playheadSecs: number;
+  pxPerSec: number;
+  scrollX?: number;
+  snapGuideSecs?: number | null;
+  /// Suppress drawing entirely when there's no project/timeline (matches the "Import
+  /// media…" empty state the main canvas shows instead of a grid).
+  hasProject: boolean;
+}
+
+/// Playhead + snap guide, previously drawn inline in `renderTimeline` at the end of every
+/// frame — moved to a separate, transparent, pointer-events:none canvas stacked on top
+/// (see `TimelineCanvas.tsx`) so scrubbing/playback (which move only these two things,
+/// ~30x/sec) no longer force a full repaint of every clip/thumbnail/waveform underneath.
+export function renderTimelineOverlay(canvas: HTMLCanvasElement, state: TimelineOverlayState): void {
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  const dpr = window.devicePixelRatio || 1;
+  const { w, h } = syncCanvasSize(canvas, ctx, dpr);
+  ctx.clearRect(0, 0, w, h);
+  if (!state.hasProject) return;
+
+  const theme = getTimelineTheme();
+  const { playheadSecs, pxPerSec, snapGuideSecs, scrollX = 0 } = state;
+
+  if (snapGuideSecs != null) {
+    const gx = clipLeft(snapGuideSecs, pxPerSec, scrollX);
+    if (gx >= TRACK_LABEL_W && gx <= w) {
+      ctx.save();
+      ctx.strokeStyle = theme.snapGuide;
+      ctx.setLineDash([4, 3]);
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(gx + 0.5, RULER_H);
+      ctx.lineTo(gx + 0.5, h);
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  // Playhead — polished marker with ruler head + shadow line
+  const phx = clipLeft(playheadSecs, pxPerSec, scrollX);
+  if (phx >= TRACK_LABEL_W - 8 && phx <= w + 8) {
+    ctx.save();
+    ctx.shadowColor = theme.clipShadow;
+    ctx.shadowBlur = 4;
+    ctx.strokeStyle = theme.playhead;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(phx + 0.5, RULER_H - 2);
+    ctx.lineTo(phx + 0.5, h);
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+
+    // Capsule head on the ruler
+    const headW = 10;
+    const headH = 14;
+    ctx.fillStyle = theme.playhead;
+    roundRect(ctx, phx - headW / 2, 4, headW, headH, 2);
+    ctx.fill();
+    // Accent notch
+    ctx.fillStyle = theme.accent;
+    ctx.fillRect(phx - 1, 6, 2, headH - 4);
+    ctx.restore();
+  }
+}
+
 export function renderTimeline(canvas: HTMLCanvasElement, state: TimelineRenderState): void {
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
   const theme = getTimelineTheme();
 
   const dpr = window.devicePixelRatio || 1;
-  const rect = canvas.getBoundingClientRect();
-  canvas.width = rect.width * dpr;
-  canvas.height = rect.height * dpr;
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-
-  const w = rect.width;
-  const h = rect.height;
+  const { w, h } = syncCanvasSize(canvas, ctx, dpr);
 
   ctx.fillStyle = theme.timelineBg;
   ctx.fillRect(0, 0, w, h);
 
-  const {
-    project,
-    playheadSecs,
-    selection,
-    pxPerSec,
-    dragGhost,
-    snapGuideSecs,
-    scrollX = 0,
-    scrollY = 0,
-  } = state;
+  const { project, selection, pxPerSec, dragGhost, scrollX = 0, scrollY = 0 } = state;
+  const selections =
+    state.selections && state.selections.length > 0
+      ? state.selections
+      : selection
+        ? [selection]
+        : [];
+  const isSelected = (trackId: string, clipId: string) =>
+    selections.some((s) => s.trackId === trackId && s.clipId === clipId);
 
   if (!project || project.tracks.length === 0) {
     ctx.fillStyle = theme.text3;
@@ -287,7 +371,7 @@ export function renderTimeline(canvas: HTMLCanvasElement, state: TimelineRenderS
       if (x + cw < TRACK_LABEL_W || x > w) continue;
       const cy = y + 18;
       const ch = trackH - 22;
-      const selected = selection?.trackId === track.id && selection?.clipId === clip.id;
+      const selected = isSelected(track.id, clip.id);
       const disabled = clip.type !== "caption" && !clip.enabled;
 
       ctx.fillStyle = clipFillColor(track.kind);
@@ -349,47 +433,9 @@ export function renderTimeline(canvas: HTMLCanvasElement, state: TimelineRenderS
   if (dragGhost) {
     drawDragGhost(ctx, project, dragGhost, pxPerSec, w, h, scrollX, scrollY);
   }
-
-  if (snapGuideSecs != null) {
-    const gx = clipLeft(snapGuideSecs, pxPerSec, scrollX);
-    if (gx >= TRACK_LABEL_W && gx <= w) {
-      ctx.save();
-      ctx.strokeStyle = theme.snapGuide;
-      ctx.setLineDash([4, 3]);
-      ctx.lineWidth = 1.5;
-      ctx.beginPath();
-      ctx.moveTo(gx + 0.5, RULER_H);
-      ctx.lineTo(gx + 0.5, h);
-      ctx.stroke();
-      ctx.restore();
-    }
-  }
-
-  // Playhead — polished marker with ruler head + shadow line
-  const phx = clipLeft(playheadSecs, pxPerSec, scrollX);
-  if (phx >= TRACK_LABEL_W - 8 && phx <= w + 8) {
-    ctx.save();
-    ctx.shadowColor = "rgba(0,0,0,0.55)";
-    ctx.shadowBlur = 4;
-    ctx.strokeStyle = theme.playhead;
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    ctx.moveTo(phx + 0.5, RULER_H - 2);
-    ctx.lineTo(phx + 0.5, h);
-    ctx.stroke();
-    ctx.shadowBlur = 0;
-
-    // Capsule head on the ruler
-    const headW = 10;
-    const headH = 14;
-    ctx.fillStyle = theme.playhead;
-    roundRect(ctx, phx - headW / 2, 4, headW, headH, 2);
-    ctx.fill();
-    // Accent notch
-    ctx.fillStyle = theme.accent;
-    ctx.fillRect(phx - 1, 6, 2, headH - 4);
-    ctx.restore();
-  }
+  // Playhead + snap guide are drawn on a separate overlay canvas — see
+  // `renderTimelineOverlay` — so their ~30Hz motion during playback/scrub doesn't repaint
+  // this canvas's clips/thumbnails/waveforms.
 
   // Fixed gutter over label column (so grid lines don't show under headers)
   ctx.fillStyle = theme.trackHeaderBg;

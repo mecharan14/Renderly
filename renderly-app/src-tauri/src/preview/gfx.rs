@@ -2,7 +2,7 @@
 
 use super::PreviewError;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 static INSTANCE: OnceLock<wgpu::Instance> = OnceLock::new();
 
@@ -37,12 +37,23 @@ pub fn create_surface_from_raw(
 
 pub struct GfxState {
     surface: wgpu::Surface<'static>,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
+    // A1: reuse the frame texture/bind-group across `present_rgba` calls instead of
+    // allocating + creating a bind group every frame; only recreated on a (w,h) change
+    // (e.g. project resolution edit or aspect switch), which is rare relative to frame rate.
+    frame_pool: Option<FramePool>,
+}
+
+struct FramePool {
+    width: u32,
+    height: u32,
+    texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
 }
 
 impl GfxState {
@@ -65,6 +76,11 @@ impl GfxState {
         height: u32,
     ) -> Result<Self, PreviewError> {
         pollster::block_on(Self::init_from_surface(surface, width, height))
+    }
+
+    /// A4: handles for `FrameRenderer::with_device` so compose and present share one GPU.
+    pub fn shared_device(&self) -> (Arc<wgpu::Device>, Arc<wgpu::Queue>) {
+        (Arc::clone(&self.device), Arc::clone(&self.queue))
     }
 
     async fn init_from_surface(
@@ -94,6 +110,8 @@ impl GfxState {
             })
             .await
             .map_err(|e| PreviewError::Wgpu(e.to_string()))?;
+        let device = Arc::new(device);
+        let queue = Arc::new(queue);
 
         let caps = surface.get_capabilities(&adapter);
         // FFmpeg delivers display-referred 8-bit RGBA (already gamma-encoded). Blitting
@@ -202,6 +220,7 @@ impl GfxState {
             pipeline,
             bind_group_layout,
             sampler,
+            frame_pool: None,
         })
     }
 
@@ -212,6 +231,26 @@ impl GfxState {
             self.surface.configure(&self.device, &self.config);
         }
         Ok(())
+    }
+
+    /// A4 hot path: blit a same-device composited texture (typically
+    /// `FrameRenderer::output_view`) onto the swapchain — no CPU readback/upload.
+    pub fn present_texture_view(&mut self, source: &wgpu::TextureView) -> Result<(), PreviewError> {
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("preview-gpu-bg"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(source),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+        self.blit_bind_group(&bind_group)
     }
 
     pub fn present_rgba(
@@ -225,20 +264,49 @@ impl GfxState {
             return Err(PreviewError::Wgpu("RGBA buffer too small".into()));
         }
 
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("preview-frame"),
-            size: wgpu::Extent3d {
+        let needs_new = match &self.frame_pool {
+            Some(pool) => pool.width != width || pool.height != height,
+            None => true,
+        };
+        if needs_new {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("preview-frame"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&Default::default());
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("preview-bg"),
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+            self.frame_pool = Some(FramePool {
                 width,
                 height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
+                texture,
+                bind_group,
+            });
+        }
+        let pool = self.frame_pool.as_ref().expect("frame_pool just set");
+        let texture = &pool.texture;
 
         // `write_texture` requires bytes_per_row to be a multiple of 256 when height > 1.
         // Project sizes like 1080×1920 yield 4320 B/row (not aligned) — uploading tight
@@ -264,7 +332,7 @@ impl GfxState {
 
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
-                texture: &texture,
+                texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -281,23 +349,11 @@ impl GfxState {
                 depth_or_array_layers: 1,
             },
         );
+        let bind_group = pool.bind_group.clone();
+        self.blit_bind_group(&bind_group)
+    }
 
-        let view = texture.create_view(&Default::default());
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("preview-bg"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        });
-
+    fn blit_bind_group(&mut self, bind_group: &wgpu::BindGroup) -> Result<(), PreviewError> {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(texture)
             | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
@@ -336,7 +392,7 @@ impl GfxState {
                 multiview_mask: None,
             });
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_bind_group(0, bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
 

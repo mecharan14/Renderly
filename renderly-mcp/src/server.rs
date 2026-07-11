@@ -1,5 +1,8 @@
-//! MCP tool handlers for Renderly — every edit dispatches through `renderly_core::apply_command`.
+//! MCP tool handlers for Renderly — every edit dispatches through `renderly_core::apply_command`
+//! when headless, or through the live Tauri WebSocket bridge (E1/E2) when the app is open
+//! on the same project.
 
+use crate::bridge_client::{try_live_bridge, BridgeClient, EditorStatusHeadless};
 use renderly_core::{
     apply_command, audio_peaks as analyze_audio_peaks, commands::ExportPreset,
     detect_scenes as analyze_scenes, detect_silence as analyze_silence, export_project, media,
@@ -10,6 +13,7 @@ use rmcp::{
     model::{ServerCapabilities, ServerInfo},
     schemars, tool, tool_handler, tool_router, ServerHandler,
 };
+use serde_json::json;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -34,9 +38,9 @@ impl RenderlyMcp {
         }
     }
 
-    fn with_session<F>(&self, f: F) -> Result<String, String>
+    fn with_session<F, R>(&self, f: F) -> Result<R, String>
     where
-        F: FnOnce(&mut Session) -> Result<String, String>,
+        F: FnOnce(&mut Session) -> Result<R, String>,
     {
         let mut guard = self
             .session
@@ -52,6 +56,44 @@ impl RenderlyMcp {
         let data = serde_json::to_string_pretty(&session.project)
             .map_err(|e| format!("serialize project: {e}"))?;
         std::fs::write(&session.path, data).map_err(|e| format!("write project: {e}"))
+    }
+
+    fn block_on_bridge<F, T>(f: F) -> Result<T, String>
+    where
+        F: std::future::Future<Output = Result<T, String>>,
+    {
+        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
+    }
+
+    /// When the desktop app is live on the same project path, run `live`; otherwise `headless`.
+    fn with_live_or_headless<R>(
+        &self,
+        live: impl FnOnce(&mut BridgeClient) -> Result<R, String>,
+        headless: impl FnOnce(&mut Session) -> Result<R, String>,
+    ) -> Result<R, String> {
+        let path = {
+            let guard = self
+                .session
+                .lock()
+                .map_err(|e| format!("session lock poisoned: {e}"))?;
+            guard.as_ref().map(|s| s.path.clone())
+        };
+        let bridged = Self::block_on_bridge(async { Ok(try_live_bridge(path.as_deref()).await) })?;
+        if let Some((_disc, mut client)) = bridged {
+            return live(&mut client);
+        }
+        self.with_session(headless)
+    }
+
+    async fn sync_session_from_bridge(
+        session: &mut Session,
+        client: &mut BridgeClient,
+    ) -> Result<(), String> {
+        let value = client.call("get_project", json!({})).await?;
+        // Bridge returns `{ project, revision }` (B3); accept a bare Project for older shapes.
+        let project_val = value.get("project").cloned().unwrap_or(value);
+        session.project = serde_json::from_value(project_val).map_err(|e| e.to_string())?;
+        Ok(())
     }
 }
 
@@ -206,9 +248,16 @@ impl RenderlyMcp {
     }
 
     fn get_project_impl(&self) -> Result<String, String> {
-        self.with_session(|session| {
-            serde_json::to_string_pretty(&session.project).map_err(|e| e.to_string())
-        })
+        self.with_live_or_headless(
+            |client| {
+                let value =
+                    Self::block_on_bridge(async { client.call("get_project", json!({})).await })?;
+                // Prefer bare project JSON for agents; fall back to full snapshot if needed.
+                let project = value.get("project").unwrap_or(&value);
+                serde_json::to_string_pretty(project).map_err(|e| e.to_string())
+            },
+            |session| serde_json::to_string_pretty(&session.project).map_err(|e| e.to_string()),
+        )
     }
 
     #[tool(
@@ -221,13 +270,36 @@ impl RenderlyMcp {
     }
 
     fn apply_command_impl(&self, req: ApplyCommandRequest) -> Result<String, String> {
-        let cmd: Command = serde_json::from_value(req.command)
+        let cmd: Command = serde_json::from_value(req.command.clone())
             .map_err(|e| format!("invalid command JSON: {e}"))?;
-        self.with_session(|session| {
-            let outcome = apply_command(&mut session.project, cmd).map_err(|e| e.to_string())?;
-            Self::save(session)?;
-            Ok(format!("{outcome:?}"))
-        })
+        self.with_live_or_headless(
+            |client| {
+                let result = Self::block_on_bridge(async {
+                    client
+                        .call("apply_command", json!({ "command": req.command }))
+                        .await
+                })?;
+                // Keep the MCP-side session mirror fresh for perception tools that stay headless.
+                if let Ok(mut guard) = self.session.lock() {
+                    if let Some(session) = guard.as_mut() {
+                        let _ = Self::block_on_bridge(async {
+                            Self::sync_session_from_bridge(session, client).await
+                        });
+                    }
+                }
+                Ok(result
+                    .get("outcome")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("ok")
+                    .to_string())
+            },
+            |session| {
+                let outcome =
+                    apply_command(&mut session.project, cmd).map_err(|e| e.to_string())?;
+                Self::save(session)?;
+                Ok(format!("{outcome:?}"))
+            },
+        )
     }
 
     #[tool(description = "Render the open project to an MP4 file")]
@@ -238,15 +310,31 @@ impl RenderlyMcp {
 
     fn export_impl(&self, req: ExportRequest) -> Result<String, String> {
         let preset = parse_preset(&req.preset)?;
-        self.with_session(|session| {
-            export_project(
-                &session.project,
-                PathBuf::from(&req.output_path).as_path(),
-                preset,
-            )
-            .map_err(|e| e.to_string())?;
-            Ok(format!("exported to {}", req.output_path))
-        })
+        self.with_live_or_headless(
+            |client| {
+                Self::block_on_bridge(async {
+                    client
+                        .call(
+                            "export",
+                            json!({
+                                "output_path": req.output_path,
+                                "preset": req.preset,
+                            }),
+                        )
+                        .await
+                })?;
+                Ok(format!("exported to {}", req.output_path))
+            },
+            |session| {
+                export_project(
+                    &session.project,
+                    PathBuf::from(&req.output_path).as_path(),
+                    preset,
+                )
+                .map_err(|e| e.to_string())?;
+                Ok(format!("exported to {}", req.output_path))
+            },
+        )
     }
 
     #[tool(
@@ -349,17 +437,86 @@ impl RenderlyMcp {
 
     fn render_frame_impl(&self, req: RenderFrameRequest) -> Result<String, String> {
         let preset = parse_preset(&req.preset)?;
-        self.with_session(|session| {
-            let png = perceive::render_frame_png(&session.project, req.time_secs, preset)
-                .map_err(|e| e.to_string())?;
-            let encoded = base64_encode(&png);
-            serde_json::to_string(&serde_json::json!({
-                "time_secs": req.time_secs,
-                "png_base64": encoded,
-                "byte_len": png.len(),
-            }))
-            .map_err(|e| e.to_string())
-        })
+        self.with_live_or_headless(
+            |client| {
+                let value = Self::block_on_bridge(async {
+                    client
+                        .call(
+                            "render_frame",
+                            json!({
+                                "time_secs": req.time_secs,
+                                "preset": req.preset,
+                            }),
+                        )
+                        .await
+                })?;
+                serde_json::to_string(&value).map_err(|e| e.to_string())
+            },
+            |session| {
+                let png = perceive::render_frame_png(&session.project, req.time_secs, preset)
+                    .map_err(|e| e.to_string())?;
+                let encoded = base64_encode(&png);
+                serde_json::to_string(&serde_json::json!({
+                    "time_secs": req.time_secs,
+                    "png_base64": encoded,
+                    "byte_len": png.len(),
+                }))
+                .map_err(|e| e.to_string())
+            },
+        )
+    }
+
+    #[tool(
+        description = "Whether the Renderly desktop app is live on this project, plus playhead/selection"
+    )]
+    fn get_editor_status(&self) -> String {
+        self.get_editor_status_impl()
+            .unwrap_or_else(|e| format!("error: {e}"))
+    }
+
+    fn get_editor_status_impl(&self) -> Result<String, String> {
+        let session_path = {
+            let guard = self
+                .session
+                .lock()
+                .map_err(|e| format!("session lock poisoned: {e}"))?;
+            guard.as_ref().map(|s| s.path.clone())
+        };
+        // Status does not require a path match — report live app even if MCP has no session.
+        let status = Self::block_on_bridge(async {
+            if let Some((_disc, mut client)) = try_live_bridge(None).await {
+                // If MCP has a project open on a different path, still report live but note mismatch.
+                let mut value = client.call("get_editor_status", json!({})).await?;
+                if let (Some(session_path), Some(obj)) =
+                    (session_path.as_ref(), value.as_object_mut())
+                {
+                    let live_path = obj
+                        .get("project_path")
+                        .and_then(|v| v.as_str())
+                        .map(PathBuf::from);
+                    let matched = live_path
+                        .as_ref()
+                        .map(|p| {
+                            p.canonicalize().unwrap_or_else(|_| p.clone())
+                                == session_path
+                                    .canonicalize()
+                                    .unwrap_or_else(|_| session_path.clone())
+                        })
+                        .unwrap_or(false);
+                    obj.insert("path_match".into(), json!(matched));
+                }
+                Ok(value)
+            } else {
+                Ok(serde_json::to_value(EditorStatusHeadless {
+                    live: false,
+                    project_path: session_path.map(|p| p.to_string_lossy().into_owned()),
+                    playhead: None,
+                    selection: None,
+                })
+                .unwrap_or(json!({ "live": false })))
+            }
+        })?;
+        serde_json::to_string_pretty(&status).map_err(|e| e.to_string())
     }
 }
 
@@ -410,8 +567,10 @@ impl ServerHandler for RenderlyMcp {
                  Open or create a project first, then apply_command with JSON commands \
                  (ImportMedia, AddTrack, AddClip, GenerateCaptions, GenerateVoiceover, \
                  SetAudioFade, SetTrackAudioRole, Export, …). \
-                 Perception: probe_media, get_transcript, render_frame, detect_silence, \
-                 detect_scenes, get_audio_peaks.",
+                 When the Renderly desktop app is running on the same project, edits go \
+                 through the live bridge (shared undo + live GUI). Use get_editor_status \
+                 to check. Perception: probe_media, get_transcript, render_frame, \
+                 detect_silence, detect_scenes, get_audio_peaks.",
         )
     }
 }

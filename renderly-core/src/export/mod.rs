@@ -13,6 +13,7 @@ use crate::project::{
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -59,26 +60,49 @@ pub struct ExportSettings {
     pub width: u32,
     pub height: u32,
     pub fps: f64,
+    /// A8: which H.264 encoder to try.
+    pub video_encoder: crate::media::VideoEncoderPreference,
+    /// CRF for libx264 (hardware encoders map this to a CQ/quality value).
+    pub crf: u8,
+    /// AAC bitrate in kbps for the mux step.
+    pub audio_bitrate_k: u32,
+}
+
+impl Default for ExportSettings {
+    fn default() -> Self {
+        Self {
+            width: 1080,
+            height: 1920,
+            fps: 30.0,
+            video_encoder: crate::media::VideoEncoderPreference::Auto,
+            crf: 18,
+            audio_bitrate_k: 192,
+        }
+    }
 }
 
 impl ExportSettings {
     pub fn from_preset(preset: &ExportPreset, project: &Project) -> Self {
-        match preset {
-            ExportPreset::TikTok9x16 => Self {
-                width: 1080,
-                height: 1920,
-                fps: project.settings.fps,
-            },
-            ExportPreset::Youtube16x9 => Self {
-                width: 1920,
-                height: 1080,
-                fps: project.settings.fps,
-            },
-            ExportPreset::Custom { width, height, fps } => Self {
-                width: *width,
-                height: *height,
-                fps: *fps,
-            },
+        let (width, height, fps) = match preset {
+            ExportPreset::TikTok9x16 => (1080, 1920, project.settings.fps),
+            ExportPreset::Youtube16x9 => (1920, 1080, project.settings.fps),
+            ExportPreset::Custom { width, height, fps } => (*width, *height, *fps),
+        };
+        Self {
+            width,
+            height,
+            fps,
+            ..Self::default()
+        }
+    }
+
+    fn encode_config(&self) -> crate::media::VideoEncodeConfig {
+        crate::media::VideoEncodeConfig {
+            width: self.width,
+            height: self.height,
+            fps: self.fps,
+            preference: self.video_encoder,
+            crf: self.crf,
         }
     }
 }
@@ -105,6 +129,54 @@ struct DecoderState {
     reader_opts: ReaderOptions,
     reader: Option<VideoReader>,
     last_source_time: f64,
+    /// A5: LRU of recently decoded frames keyed by quantized source time. Avoids
+    /// respawning FFmpeg on every backward scrub / small seek within the window.
+    cache: FrameLru,
+}
+
+/// ~60 preview-res frames. At panel height (~540p) that's on the order of ~100 MB;
+/// capacity is intentionally modest and shared per decoder (per track).
+const FRAME_CACHE_CAPACITY: usize = 60;
+
+#[derive(Default)]
+struct FrameLru {
+    /// Insertion order (front = oldest).
+    order: std::collections::VecDeque<i64>,
+    map: HashMap<i64, RgbaFrame>,
+}
+
+impl FrameLru {
+    fn get(&mut self, key: i64) -> Option<RgbaFrame> {
+        let frame = self.map.get(&key)?.clone();
+        // Touch: move key to the back (most recently used).
+        if let Some(pos) = self.order.iter().position(|&k| k == key) {
+            self.order.remove(pos);
+            self.order.push_back(key);
+        }
+        Some(frame)
+    }
+
+    fn insert(&mut self, key: i64, frame: RgbaFrame) {
+        if let std::collections::hash_map::Entry::Occupied(mut e) = self.map.entry(key) {
+            e.insert(frame);
+            if let Some(pos) = self.order.iter().position(|&k| k == key) {
+                self.order.remove(pos);
+                self.order.push_back(key);
+            }
+            return;
+        }
+        while self.order.len() >= FRAME_CACHE_CAPACITY {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+        self.order.push_back(key);
+        self.map.insert(key, frame);
+    }
+}
+
+fn quantize_source_time_ms(source_time: f64) -> i64 {
+    (source_time * 1000.0).round() as i64
 }
 
 impl DecoderState {
@@ -114,10 +186,17 @@ impl DecoderState {
             reader_opts,
             reader: None,
             last_source_time: f64::NAN,
+            cache: FrameLru::default(),
         }
     }
 
     fn frame_at(&mut self, source_time: f64) -> Result<Option<RgbaFrame>, FfmpegCliError> {
+        let key = quantize_source_time_ms(source_time);
+        if let Some(cached) = self.cache.get(key) {
+            self.last_source_time = source_time;
+            return Ok(Some(cached));
+        }
+
         let needs_reopen = self.reader.is_none()
             || source_time + 1e-6 < self.last_source_time
             || (source_time - self.last_source_time).abs() > 0.5;
@@ -133,6 +212,9 @@ impl DecoderState {
         let reader = self.reader.as_mut().expect("reader just opened");
         let frame = reader.read_frame()?;
         self.last_source_time = source_time;
+        if let Some(ref f) = frame {
+            self.cache.insert(key, f.clone());
+        }
         Ok(frame)
     }
 }
@@ -170,7 +252,105 @@ impl FrameRenderer {
         })
     }
 
+    /// A4: share the preview surface's wgpu device so compose stays on the GPU and the
+    /// app can blit [`Self::output_view`] without a CPU readback.
+    pub fn with_device(
+        device: std::sync::Arc<wgpu::Device>,
+        queue: std::sync::Arc<wgpu::Queue>,
+        settings: ExportSettings,
+        decode_opts: DecodeOptions,
+    ) -> Result<Self, ExportError> {
+        let compositor = Compositor::with_device(device, queue, settings.width, settings.height)?;
+        Ok(Self {
+            settings,
+            decode_opts,
+            compositor,
+            decoders: HashMap::new(),
+        })
+    }
+
+    pub fn output_view(&self) -> &wgpu::TextureView {
+        self.compositor.output_view()
+    }
+
+    pub fn output_size(&self) -> (u32, u32) {
+        (self.compositor.width(), self.compositor.height())
+    }
+
+    /// A5: warm the per-track decode LRU around `time_secs` so scrubbing nearby
+    /// (especially backward) hits cache instead of respawning FFmpeg. Decodes only —
+    /// does not composite or present. Safe to call from the scrub worker after a present;
+    /// respects the same decoder reopen rules as [`Self::render`].
+    pub fn prefetch_around(
+        &mut self,
+        project: &Project,
+        time_secs: f64,
+        window_secs: f64,
+    ) -> Result<(), ExportError> {
+        let fps = self.settings.fps.max(1.0);
+        let step = 1.0 / fps;
+        let window = window_secs.max(0.0);
+        let start = (time_secs - window).max(0.0);
+        let end = time_secs + window;
+        let reader_opts = ReaderOptions {
+            target_height: self.decode_opts.target_height,
+            output_fps: self.decode_opts.output_fps,
+        };
+
+        let mut t = start;
+        while t <= end + 1e-9 {
+            let layers = active_layers(project, t)?;
+            for layer in &layers {
+                let decoder = self
+                    .decoders
+                    .entry(layer.decoder_key)
+                    .or_insert_with(|| DecoderState::new(layer.path.clone(), reader_opts));
+                if decoder.path != layer.path {
+                    *decoder = DecoderState::new(layer.path.clone(), reader_opts);
+                }
+                let _ = decoder.frame_at(layer.source_time)?;
+            }
+            t += step;
+        }
+        Ok(())
+    }
+
     pub fn render(&mut self, project: &Project, time_secs: f64) -> Result<Vec<u8>, ExportError> {
+        self.render_inner(project, time_secs, true)
+            .map(|(pixels, _)| pixels.expect("readback requested"))
+    }
+
+    /// Same as [`Self::render`], plus a coarse decode-vs-compose time breakdown for the
+    /// perf HUD (improvement-plan A0 — "measure from day one" before A1-A8 touch this hot
+    /// path). Export and MCP perception stay on the untimed `render` — the few
+    /// `Instant::now()` calls this adds are negligible next to a decode+composite, but
+    /// there's no reason to pay even that for callers nobody's watching a HUD for.
+    pub fn render_timed(
+        &mut self,
+        project: &Project,
+        time_secs: f64,
+    ) -> Result<(Vec<u8>, FrameTiming), ExportError> {
+        self.render_inner(project, time_secs, true)
+            .map(|(pixels, timing)| (pixels.expect("readback requested"), timing))
+    }
+
+    /// A4: decode + GPU compose with no CPU readback. Result lives in
+    /// [`Self::output_view`] for the preview blit path.
+    pub fn render_to_texture(
+        &mut self,
+        project: &Project,
+        time_secs: f64,
+    ) -> Result<FrameTiming, ExportError> {
+        self.render_inner(project, time_secs, false)
+            .map(|(_, timing)| timing)
+    }
+
+    fn render_inner(
+        &mut self,
+        project: &Project,
+        time_secs: f64,
+        readback: bool,
+    ) -> Result<(Option<Vec<u8>>, FrameTiming), ExportError> {
         let layers = active_layers(project, time_secs)?;
         let mut compose_layers = Vec::with_capacity(layers.len() + 2);
         let plugin_host = crate::plugins::PluginHost::for_project(project).ok();
@@ -179,6 +359,7 @@ impl FrameRenderer {
             target_height: self.decode_opts.target_height,
             output_fps: self.decode_opts.output_fps,
         };
+        let mut decode_secs = 0.0;
         for layer in &layers {
             let decoder = self
                 .decoders
@@ -187,7 +368,10 @@ impl FrameRenderer {
             if decoder.path != layer.path {
                 *decoder = DecoderState::new(layer.path.clone(), reader_opts);
             }
-            if let Some(mut frame) = decoder.frame_at(layer.source_time)? {
+            let decode_start = Instant::now();
+            let frame = decoder.frame_at(layer.source_time)?;
+            decode_secs += decode_start.elapsed().as_secs_f64();
+            if let Some(mut frame) = frame {
                 crate::packs::apply_pack_effects(project, &mut frame, &layer.effects);
                 if let Some(host) = plugin_host.as_ref() {
                     let _ = host.apply_effects(&mut frame, &layer.effects);
@@ -223,10 +407,33 @@ impl FrameRenderer {
             });
         }
 
-        self.compositor
-            .composite(&compose_layers)
-            .map_err(ExportError::from)
+        let compose_start = Instant::now();
+        let pixels = if readback {
+            Some(self.compositor.composite(&compose_layers)?)
+        } else {
+            self.compositor.compose_to_texture(&compose_layers)?;
+            None
+        };
+        let compose_secs = compose_start.elapsed().as_secs_f64();
+
+        Ok((
+            pixels,
+            FrameTiming {
+                decode_ms: decode_secs * 1000.0,
+                compose_ms: compose_secs * 1000.0,
+            },
+        ))
     }
+}
+
+/// Coarse per-frame timing breakdown from [`FrameRenderer::render_timed`] — decode is the
+/// sum across every active layer's `frame_at` call, compose is the single
+/// `Compositor::composite` call. Doesn't cover present (that's on the GPU-present side,
+/// e.g. `gfx.rs`'s `present_rgba`, timed by the caller since it's outside `renderly-core`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
+pub struct FrameTiming {
+    pub decode_ms: f64,
+    pub compose_ms: f64,
 }
 
 /// Render one composited RGBA frame at `time_secs` (video + burned-in captions).
@@ -265,11 +472,21 @@ pub fn export_project_with_progress(
     preset: ExportPreset,
     on_progress: &mut dyn FnMut(ExportProgress) -> bool,
 ) -> Result<(), ExportError> {
+    let settings = ExportSettings::from_preset(&preset, project);
+    export_project_with_settings(project, output_path, settings, on_progress)
+}
+
+/// Export using an explicit [`ExportSettings`] (A8/C5 — codec, CRF, audio bitrate, size).
+pub fn export_project_with_settings(
+    project: &Project,
+    output_path: &Path,
+    settings: ExportSettings,
+    on_progress: &mut dyn FnMut(ExportProgress) -> bool,
+) -> Result<(), ExportError> {
     if !crate::media::ffmpeg_available() {
         return Err(FfmpegCliError::NotFound.into());
     }
 
-    let settings = ExportSettings::from_preset(&preset, project);
     let duration_secs = timeline_duration(project);
     if duration_secs <= 0.0 {
         return Err(ExportError::EmptyTimeline);
@@ -316,8 +533,7 @@ fn export_project_with_progress_inner(
     temp_video: &Path,
     on_progress: &mut dyn FnMut(ExportProgress) -> bool,
 ) -> Result<(), ExportError> {
-    let mut encoder =
-        VideoEncoder::open(temp_video, settings.width, settings.height, settings.fps)?;
+    let mut encoder = VideoEncoder::open(temp_video, &settings.encode_config())?;
     // `output_fps: Some(settings.fps)` paces each source decoder to the export frame rate
     // (ffmpeg duplicates/drops frames to match) rather than the source's native fps —
     // this also fixes frame-pacing drift for sources whose fps doesn't match the export.
@@ -387,7 +603,12 @@ fn export_project_with_progress_inner(
     }) {
         return Err(ExportError::Cancelled);
     }
-    mux_video_audio(temp_video, &temp_audio, output_path)?;
+    mux_video_audio(
+        temp_video,
+        &temp_audio,
+        output_path,
+        settings.audio_bitrate_k,
+    )?;
     Ok(())
 }
 
@@ -1058,6 +1279,34 @@ mod tests {
     }
 
     #[test]
+    fn frame_lru_evicts_oldest_and_returns_hits() {
+        fn tiny(n: u8) -> RgbaFrame {
+            RgbaFrame {
+                width: 1,
+                height: 1,
+                pixels: vec![n, 0, 0, 255],
+            }
+        }
+        let mut lru = FrameLru::default();
+        assert!(lru.get(0).is_none());
+        lru.insert(10, tiny(1));
+        lru.insert(20, tiny(2));
+        assert_eq!(lru.get(10).unwrap().pixels[0], 1);
+        // Touch 10 so 20 becomes oldest once we fill past capacity... for a small
+        // capacity check, fill to FRAME_CACHE_CAPACITY and ensure the untouched key goes.
+        for i in 0..FRAME_CACHE_CAPACITY {
+            lru.insert(100 + i as i64, tiny(3));
+        }
+        // 20 was never touched after insert; 10 was touched via get — depending on order,
+        // after filling with new keys both early keys should be gone.
+        assert!(
+            lru.get(20).is_none(),
+            "untouched early key must be evicted once capacity is exceeded"
+        );
+        assert_eq!(lru.order.len(), FRAME_CACHE_CAPACITY);
+    }
+
+    #[test]
     fn timeline_duration_uses_latest_clip_end() {
         let mut project = Project::new("t", Settings::default());
         let track = crate::project::Track::new(TrackKind::Video, "V1");
@@ -1208,6 +1457,7 @@ mod tests {
             width: 320,
             height: 240,
             fps: 30.0,
+            ..Default::default()
         };
         let mut renderer = FrameRenderer::new(settings, DecodeOptions::default()).expect("new");
         // Sequential monotonic renders reuse the same decoder without reopening ffmpeg.
@@ -1217,6 +1467,72 @@ mod tests {
             .expect("render frame 1");
         assert_eq!(frame_a.len(), (320 * 240 * 4) as usize);
         assert_eq!(frame_b.len(), (320 * 240 * 4) as usize);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn render_timed_matches_render_pixels_and_reports_nonzero_decode() {
+        if !ffmpeg_available() {
+            eprintln!("skipping render_timed test: ffmpeg not on PATH");
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("renderly-timed-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let video_path = dir.join("src.mp4");
+        generate_test_video(&video_path);
+
+        let mut project = Project::new("render-timed-test", Settings::default());
+        let media_id = uuid::Uuid::new_v4();
+        project.media.push(crate::project::MediaItem {
+            id: media_id,
+            path: video_path.clone(),
+            kind: MediaKind::Video,
+            duration_secs: Some(1.0),
+            width: Some(320),
+            height: Some(240),
+            fps: Some(30.0),
+        });
+        let track = crate::project::Track::new(TrackKind::Video, "V1");
+        project.tracks.push(track);
+        project.tracks[0]
+            .clips
+            .push(Clip::Video(crate::project::MediaClip {
+                id: uuid::Uuid::new_v4(),
+                media_id,
+                position_secs: 0.0,
+                source_in_secs: 0.0,
+                source_out_secs: 1.0,
+                gain_db: 0.0,
+                enabled: true,
+                fade_in_secs: 0.0,
+                fade_out_secs: 0.0,
+                ..Default::default()
+            }));
+
+        let settings = ExportSettings {
+            width: 320,
+            height: 240,
+            fps: 30.0,
+            ..Default::default()
+        };
+        let mut timed_renderer =
+            FrameRenderer::new(settings, DecodeOptions::default()).expect("new");
+        let (timed_pixels, timing) = timed_renderer
+            .render_timed(&project, 0.0)
+            .expect("render_timed");
+
+        let mut plain_renderer =
+            FrameRenderer::new(settings, DecodeOptions::default()).expect("new");
+        let plain_pixels = plain_renderer.render(&project, 0.0).expect("render");
+
+        assert_eq!(timed_pixels, plain_pixels);
+        // A real decode + composite of an actual video frame never completes in 0ms; a
+        // regression that stops timing the decode loop (e.g. measuring outside it) would
+        // silently report exactly this.
+        assert!(timing.decode_ms > 0.0);
+        assert!(timing.compose_ms >= 0.0);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1269,6 +1585,7 @@ mod tests {
             width: 320,
             height: 240,
             fps: 30.0,
+            ..Default::default()
         };
         let mut renderer = FrameRenderer::new(settings, DecodeOptions::default()).expect("new");
         renderer.render(&project, 0.0).expect("render");

@@ -9,18 +9,22 @@ import {
   CircleDashed,
 } from "lucide-react";
 import { useEditorStore } from "../../store/editorStore";
-import { splitSelectedAtPlayhead } from "../../timeline/interactions";
+import { getAction, invokeAction } from "../../lib/actions";
 import { IconButton } from "../ui/IconButton";
 import { Tooltip } from "../ui/Tooltip";
 import { AddTrackMenu } from "./AddTrackMenu";
 
+function tip(id: string, fallback: string): string {
+  const a = getAction(id);
+  if (!a) return fallback;
+  return a.shortcut ? `${a.label} (${a.shortcut})` : a.label;
+}
+
 export function TimelineToolbar() {
   const toolMode = useEditorStore((s) => s.toolMode);
-  const setTool = useEditorStore((s) => s.setTool);
   const snapEnabled = useEditorStore((s) => s.snapEnabled);
   const setSnap = useEditorStore((s) => s.setSnap);
   const pxPerSec = useEditorStore((s) => s.pxPerSec);
-  const setZoom = useEditorStore((s) => s.setZoom);
   const fitZoom = useEditorStore((s) => s.fitZoom);
   const toast = useEditorStore((s) => s.toast);
   const project = useEditorStore((s) => s.project);
@@ -28,33 +32,33 @@ export function TimelineToolbar() {
   return (
     <div className="timeline-tools">
       <div className="tool-group">
-        <Tooltip content="Select · move and trim (V)">
+        <Tooltip content={tip("tool.select", "Select (V)")}>
           <button
             type="button"
             className={`tool-btn icon-only${toolMode === "select" ? " active" : ""}`}
-            onClick={() => setTool("select")}
+            onClick={() => invokeAction("tool.select")}
           >
             <MousePointer2 size={15} strokeWidth={1.75} />
           </button>
         </Tooltip>
-        <Tooltip content="Razor · click a clip to split (C)">
+        <Tooltip content={tip("tool.razor", "Razor (C)")}>
           <button
             type="button"
             className={`tool-btn icon-only${toolMode === "razor" ? " active" : ""}`}
             onClick={() => {
-              setTool("razor");
+              invokeAction("tool.razor");
               toast("Click a clip to split it", "info");
             }}
           >
             <Scissors size={15} strokeWidth={1.75} />
           </button>
         </Tooltip>
-        <Tooltip content="Mask · draw/edit rect or ellipse on preview (M)">
+        <Tooltip content={tip("tool.mask", "Mask (M)")}>
           <button
             type="button"
             className={`tool-btn icon-only${toolMode === "mask" ? " active" : ""}`}
             onClick={() => {
-              setTool("mask");
+              invokeAction("tool.mask");
               toast("Drag on the paused preview to draw a mask", "info");
             }}
           >
@@ -67,9 +71,9 @@ export function TimelineToolbar() {
         icon={SplitSquareHorizontal}
         iconOnly
         size="sm"
-        tooltip="Split at playhead (S)"
+        tooltip={tip("edit.split", "Split at playhead")}
         disabled={!project}
-        onClick={() => void splitSelectedAtPlayhead()}
+        onClick={() => invokeAction("edit.split")}
       />
 
       <Tooltip content="Snap to grid and clip edges">
@@ -91,16 +95,16 @@ export function TimelineToolbar() {
           icon={ZoomOut}
           iconOnly
           size="sm"
-          tooltip="Zoom out"
-          onClick={() => setZoom(pxPerSec - 20)}
+          tooltip={tip("timeline.zoom-out", "Zoom out")}
+          onClick={() => invokeAction("timeline.zoom-out")}
         />
         <span className="zoom-label">{Math.round((pxPerSec / 80) * 100)}%</span>
         <IconButton
           icon={ZoomIn}
           iconOnly
           size="sm"
-          tooltip="Zoom in"
-          onClick={() => setZoom(pxPerSec + 20)}
+          tooltip={tip("timeline.zoom-in", "Zoom in")}
+          onClick={() => invokeAction("timeline.zoom-in")}
         />
         <IconButton
           icon={Maximize}

@@ -62,4 +62,22 @@ impl PlatformPreview {
             Self::Wayland(p) => p.present_rgba(pixels, width, height),
         }
     }
+
+    pub fn shared_device(
+        &self,
+    ) -> Option<(std::sync::Arc<wgpu::Device>, std::sync::Arc<wgpu::Queue>)> {
+        match self {
+            Self::Unattached => None,
+            Self::X11(p) => p.shared_device(),
+            Self::Wayland(p) => p.shared_device(),
+        }
+    }
+
+    pub fn present_texture_view(&mut self, source: &wgpu::TextureView) -> Result<(), PreviewError> {
+        match self {
+            Self::Unattached => Err(PreviewError::NotInitialized),
+            Self::X11(p) => p.present_texture_view(source),
+            Self::Wayland(p) => p.present_texture_view(source),
+        }
+    }
 }

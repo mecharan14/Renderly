@@ -6,6 +6,7 @@ import { useEditorStore } from "../../store/editorStore";
 
 type PresetId = "tiktok" | "youtube" | "project";
 type Stage = "choose" | "exporting" | "done" | "cancelled" | "error";
+type VideoEncoderId = "auto" | "software" | "nvenc" | "qsv";
 
 function phaseLabel(phase: ExportPhase): string {
   switch (phase) {
@@ -40,6 +41,9 @@ export function ExportDialog({ open, onClose }: { open: boolean; onClose: () => 
   const toast = useEditorStore((s) => s.toast);
 
   const [preset, setPreset] = useState<PresetId>("tiktok");
+  const [videoEncoder, setVideoEncoder] = useState<VideoEncoderId>("auto");
+  const [crf, setCrf] = useState(18);
+  const [audioBitrateK, setAudioBitrateK] = useState(192);
   const [stage, setStage] = useState<Stage>("choose");
   const [fraction, setFraction] = useState(0);
   const [phase, setPhase] = useState<ExportPhase>("video");
@@ -99,6 +103,7 @@ export function ExportDialog({ open, onClose }: { open: boolean; onClose: () => 
       await ipc.exportProject(
         path,
         presetArg(preset, project.settings.width, project.settings.height, project.settings.fps),
+        { videoEncoder, crf, audioBitrateK },
       );
       setFraction(1);
       setStage("done");
@@ -173,6 +178,50 @@ export function ExportDialog({ open, onClose }: { open: boolean; onClose: () => 
               </span>
             </button>
           </div>
+
+          <div className="export-encode-options">
+            <div className="field">
+              <label htmlFor="export-encoder">Video encoder</label>
+              <select
+                id="export-encoder"
+                value={videoEncoder}
+                onChange={(e) => setVideoEncoder(e.target.value as VideoEncoderId)}
+              >
+                <option value="auto">Auto</option>
+                <option value="software">Software</option>
+                <option value="nvenc">NVENC</option>
+                <option value="qsv">QSV</option>
+              </select>
+            </div>
+            <div className="field">
+              <label htmlFor="export-crf">
+                Quality (CRF) · {crf}
+                <span className="field-hint"> lower = better</span>
+              </label>
+              <input
+                id="export-crf"
+                type="range"
+                min={14}
+                max={28}
+                step={1}
+                value={crf}
+                onChange={(e) => setCrf(Number(e.target.value))}
+              />
+            </div>
+            <div className="field">
+              <label htmlFor="export-audio-bitrate">Audio bitrate</label>
+              <select
+                id="export-audio-bitrate"
+                value={audioBitrateK}
+                onChange={(e) => setAudioBitrateK(Number(e.target.value))}
+              >
+                <option value={128}>128 kbps</option>
+                <option value={192}>192 kbps</option>
+                <option value={256}>256 kbps</option>
+              </select>
+            </div>
+          </div>
+
           <menu>
             <button type="button" className="btn" onClick={onClose}>
               Close

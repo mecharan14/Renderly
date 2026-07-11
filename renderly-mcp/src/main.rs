@@ -1,3 +1,4 @@
+mod bridge_client;
 mod server;
 
 use anyhow::Result;

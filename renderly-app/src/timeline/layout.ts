@@ -49,53 +49,6 @@ export function snapToFrame(secs: number, fps: number): number {
   return Math.max(0, Math.round(secs * f) / f);
 }
 
-export function collectSnapTimes(
-  project: Project,
-  playheadSecs: number,
-  excludeClipId?: string,
-): number[] {
-  const times = new Set<number>([playheadSecs, 0, timelineDuration(project)]);
-  for (const track of project.tracks) {
-    for (const clip of track.clips) {
-      if (clip.id === excludeClipId) continue;
-      times.add(clip.position_secs);
-      times.add(clip.position_secs + clipDurationSecs(clip));
-    }
-  }
-  // Coarse second grid (not every frame — that floods the set at long durations).
-  const duration = timelineDuration(project);
-  for (let t = 1; t < duration; t += 1) times.add(t);
-  return [...times];
-}
-
-const SNAP_THRESHOLD_PX = 10;
-
-export function snapTime(
-  secs: number,
-  project: Project,
-  playheadSecs: number,
-  pxPerSec: number,
-  snapEnabled: boolean,
-  excludeClipId?: string,
-): number {
-  const fps = project.settings.fps || 30;
-  const framed = snapToFrame(Math.max(0, secs), fps);
-  if (!snapEnabled) return framed;
-
-  const threshold = SNAP_THRESHOLD_PX / pxPerSec;
-  let best = framed;
-  let bestDist = threshold;
-  for (const target of collectSnapTimes(project, playheadSecs, excludeClipId)) {
-    const dist = Math.abs(target - secs);
-    if (dist < bestDist) {
-      bestDist = dist;
-      best = target;
-    }
-  }
-  // Prefer exact clip-edge hits; otherwise keep frame-quantized value.
-  return bestDist < threshold ? best : framed;
-}
-
 export function trackLayout(_viewportH: number, _trackCount: number, scrollY = 0) {
   const trackH = TRACK_H;
   return {

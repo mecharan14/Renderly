@@ -47,17 +47,81 @@ pub struct PlaybackErrorEvent {
     pub message: String,
 }
 
+/// Emitted ~1 Hz while playing (see improvement-plan A0 — "measure from day one" before
+/// A1-A8 touch this hot path). Averaged over the emit window, not instantaneous, so a
+/// single slow frame (GC-style hiccup, disk stall) doesn't make the HUD unreadable.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct PlaybackPerfEvent {
+    pub decode_ms: f64,
+    pub compose_ms: f64,
+    pub present_ms: f64,
+    pub frame_ms: f64,
+    pub fps: f64,
+}
+
+/// Accumulates per-frame timing and periodically drains itself into a `PlaybackPerfEvent`
+/// — a plain averaging accumulator, not a ring buffer: A0 only needs "what's it been
+/// like for the last second", not a full history.
+#[derive(Default)]
+struct PerfAccumulator {
+    frames: u32,
+    decode_ms: f64,
+    compose_ms: f64,
+    present_ms: f64,
+    frame_ms: f64,
+    window_start: Option<Instant>,
+}
+
+impl PerfAccumulator {
+    fn record(&mut self, timing: renderly_core::FrameTiming, present_ms: f64, frame_ms: f64) {
+        if self.window_start.is_none() {
+            self.window_start = Some(Instant::now());
+        }
+        self.frames += 1;
+        self.decode_ms += timing.decode_ms;
+        self.compose_ms += timing.compose_ms;
+        self.present_ms += present_ms;
+        self.frame_ms += frame_ms;
+    }
+
+    /// Drains and returns an averaged event once `PERF_EMIT_INTERVAL` has elapsed since
+    /// the window started; otherwise leaves the accumulator untouched.
+    fn maybe_drain(&mut self) -> Option<PlaybackPerfEvent> {
+        let elapsed = self.window_start?.elapsed();
+        if elapsed < PERF_EMIT_INTERVAL || self.frames == 0 {
+            return None;
+        }
+        let n = self.frames as f64;
+        let event = PlaybackPerfEvent {
+            decode_ms: self.decode_ms / n,
+            compose_ms: self.compose_ms / n,
+            present_ms: self.present_ms / n,
+            frame_ms: self.frame_ms / n,
+            fps: n / elapsed.as_secs_f64(),
+        };
+        *self = Self::default();
+        Some(event)
+    }
+}
+
 const TICK_INTERVAL: Duration = Duration::from_millis(33);
+const PERF_EMIT_INTERVAL: Duration = Duration::from_secs(1);
 
 struct PlaySession {
     stop: Arc<AtomicUsize>, // 0 = running, 1 = stop requested
     seek: Arc<Mutex<Option<f64>>>,
     current_time: Arc<Mutex<f64>>,
+    /// Shared with the playback thread; `update_live_project` swaps its contents so an
+    /// edit made while playing shows up on the next rendered frame without stopping
+    /// audio or reopening decoders — see `update_live_project`'s doc comment.
+    /// Outer `Arc`/`Mutex` for sharing; inner `Arc<Project>` so live swaps and
+    /// `project.lock().clone()` snapshots are cheap (B3 — no full Project clone).
+    project: Arc<Mutex<Arc<Project>>>,
     thread: JoinHandle<()>,
 }
 
 struct ScrubRequest {
-    project: Project,
+    project: Arc<Project>,
     time_secs: f64,
     settings: ExportSettings,
     decode_opts: DecodeOptions,
@@ -101,6 +165,11 @@ impl PlaybackEngine {
         self.target_height.store(height, Ordering::SeqCst);
     }
 
+    /// Current preview target height in pixels (`0` = unset / full-res fallback).
+    pub fn target_height(&self) -> u32 {
+        self.target_height.load(Ordering::SeqCst)
+    }
+
     fn decode_opts(&self, output_fps: f64) -> DecodeOptions {
         let h = self.target_height.load(Ordering::SeqCst);
         DecodeOptions {
@@ -140,6 +209,11 @@ impl PlaybackEngine {
         }
     }
 
+    /// Whether a play session is currently active (bridge status / HUD).
+    pub fn is_playing(&self) -> bool {
+        self.session.lock().is_some()
+    }
+
     /// If a play session is active, coalesce a seek into it (the loop picks up the
     /// latest value on its next iteration and restarts audio/decoders from there — a
     /// newer seek arriving before the loop observes an older one simply replaces it).
@@ -155,7 +229,30 @@ impl PlaybackEngine {
         }
     }
 
-    pub fn play(&self, app: AppHandle, project: Project, start_secs: f64) {
+    /// Live-swap the project for the active play session so the *next* rendered frame
+    /// reflects an edit — no pause, no audio-sink teardown, no decoder respawn. Safe for
+    /// both property edits (opacity/gain/effects) and structural ones (split/move/delete):
+    /// `FrameRenderer::render` takes the project by reference on every call and its
+    /// decoder cache is keyed by track id, reopening ffmpeg whenever the active clip's
+    /// source path at that track changes — exactly the same recovery path an ordinary
+    /// forward seek already exercises. Returns `false` if nothing is playing, so the
+    /// caller can fall back to a paused-state scrub render instead.
+    ///
+    /// One caveat: the audio track was pre-mixed once for the whole remaining play range
+    /// at the last restart (see `run_playback_loop`), so gain/mute/audio-clip edits are
+    /// picked up visually next frame but won't be audible until the next natural restart
+    /// (seek, loop end). Segmented premix (planned separately) removes this caveat.
+    pub fn update_live_project(&self, project: Arc<Project>) -> bool {
+        let guard = self.session.lock();
+        if let Some(session) = guard.as_ref() {
+            *session.project.lock() = project;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn play(&self, app: AppHandle, project: Arc<Project>, start_secs: f64) {
         self.stop();
         // Claims the preview surface for this playback generation — see `ScrubRequest`'s
         // `epoch` doc comment.
@@ -167,35 +264,38 @@ impl PlaybackEngine {
             width: project.settings.width,
             height: project.settings.height,
             fps,
+            ..Default::default()
         };
-        // target_height is deliberately NOT used for continuous playback (unlike
-        // paused-state scrub, see `submit_scrub`): a decoder held open across many
-        // sequential reads needs `frame_bytes` (computed from our own predicted scaled
-        // dimensions) to exactly match what ffmpeg's `-vf scale=-2:h` actually emits — if
-        // our rounding and ffmpeg's ever disagree by even a couple of pixels, every frame
-        // after the first reads mis-aligned bytes from the raw pipe, which free-runs
-        // uncorrected for the rest of the stream and looks exactly like the video
-        // glitching/corrupting progressively during playback. A single scrub-rendered
-        // frame reopens the decoder fresh each time, so it can never accumulate that
-        // drift — full source resolution here trades some CPU for correctness.
-        let decode_opts = DecodeOptions {
-            target_height: None,
-            output_fps: Some(fps),
-        };
+        // A2: decode at panel resolution instead of full source resolution during
+        // continuous playback too (previously only the paused-state scrub path did this
+        // via `decode_opts()`, see `submit_scrub`). This is safe *only* because
+        // `scaled_dimensions`/`ffalign_even` in `renderly-core::media::ffmpeg_cli` now
+        // exactly mirror ffmpeg's own `FFALIGN(lrint(x), 2)` resolution of a `scale=-2:h`
+        // filter (verified against real ffmpeg output for several odd-dimension sources,
+        // not just derived on paper) — a decoder held open across many sequential reads
+        // needs our predicted `frame_bytes` to exactly match what ffmpeg emits, or every
+        // frame after the first reads mis-aligned bytes from the raw pipe and free-runs
+        // uncorrected, which looks exactly like the video corrupting/glitching
+        // progressively during playback. Decoding a 1080p/4K source at panel height
+        // (typically a few hundred px) is a several-times reduction in decode + memcpy
+        // work per frame — the single biggest felt playback-performance win here.
+        let decode_opts = self.decode_opts(fps);
 
         let stop = Arc::new(AtomicUsize::new(0));
         let seek = Arc::new(Mutex::new(None::<f64>));
         let current_time = Arc::new(Mutex::new(start_secs.min(duration.max(0.0))));
+        let project = Arc::new(Mutex::new(project));
 
         let stop_clone = Arc::clone(&stop);
         let seek_clone = Arc::clone(&seek);
         let current_time_clone = Arc::clone(&current_time);
+        let project_clone = Arc::clone(&project);
         let start_secs = start_secs.max(0.0);
 
         let thread = thread::spawn(move || {
             run_playback_loop(
                 app,
-                project,
+                project_clone,
                 start_secs,
                 duration,
                 settings,
@@ -210,25 +310,26 @@ impl PlaybackEngine {
             stop,
             seek,
             current_time,
+            project,
             thread,
         });
     }
 
     /// Render a single frame at `time_secs` (paused-state seek); coalesced with any
     /// other pending scrub/seek request.
-    pub fn request_preview(&self, app: AppHandle, project: Project, time_secs: f64) {
+    pub fn request_preview(&self, app: AppHandle, project: Arc<Project>, time_secs: f64) {
         self.submit_scrub(app, project, time_secs, false);
     }
 
     /// Render a single frame at `time_secs` and play a short audio blip; coalesced.
-    pub fn request_scrub_audio(&self, app: AppHandle, project: Project, time_secs: f64) {
+    pub fn request_scrub_audio(&self, app: AppHandle, project: Arc<Project>, time_secs: f64) {
         self.submit_scrub(app, project, time_secs, true);
     }
 
     fn submit_scrub(
         &self,
         app: AppHandle,
-        project: Project,
+        project: Arc<Project>,
         time_secs: f64,
         with_audio_blip: bool,
     ) {
@@ -237,6 +338,7 @@ impl PlaybackEngine {
             width: project.settings.width,
             height: project.settings.height,
             fps,
+            ..Default::default()
         };
         // Paused-state preview decodes a single frame; no output-fps pacing needed.
         let decode_opts = DecodeOptions {
@@ -269,7 +371,7 @@ impl Drop for TempDirGuard {
 #[allow(clippy::too_many_arguments)]
 fn run_playback_loop(
     app: AppHandle,
-    project: Project,
+    project: Arc<Mutex<Arc<Project>>>,
     mut start_secs: f64,
     duration: f64,
     settings: ExportSettings,
@@ -278,24 +380,63 @@ fn run_playback_loop(
     seek: Arc<Mutex<Option<f64>>>,
     current_time: Arc<Mutex<f64>>,
 ) {
-    let mut renderer = match FrameRenderer::new(settings, decode_opts) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("playback: frame renderer init failed: {e}");
-            let _ = app.emit(
-                "playback:state",
-                PlaybackStateEvent {
-                    playing: false,
-                    time_secs: start_secs,
-                },
-            );
-            let _ = app.emit(
-                "playback:error",
-                PlaybackErrorEvent {
-                    message: format!("Could not start playback: {e}"),
-                },
-            );
-            return;
+    let (mut renderer, gpu_present) = {
+        let shared = app
+            .state::<crate::AppState>()
+            .preview
+            .lock()
+            .shared_device();
+        match shared {
+            Some((device, queue)) => {
+                match FrameRenderer::with_device(device, queue, settings, decode_opts) {
+                    Ok(r) => (r, true),
+                    Err(e) => {
+                        eprintln!(
+                            "playback: shared-device renderer init failed ({e}); falling back"
+                        );
+                        match FrameRenderer::new(settings, decode_opts) {
+                            Ok(r) => (r, false),
+                            Err(e) => {
+                                eprintln!("playback: frame renderer init failed: {e}");
+                                let _ = app.emit(
+                                    "playback:state",
+                                    PlaybackStateEvent {
+                                        playing: false,
+                                        time_secs: start_secs,
+                                    },
+                                );
+                                let _ = app.emit(
+                                    "playback:error",
+                                    PlaybackErrorEvent {
+                                        message: format!("Could not start playback: {e}"),
+                                    },
+                                );
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            None => match FrameRenderer::new(settings, decode_opts) {
+                Ok(r) => (r, false),
+                Err(e) => {
+                    eprintln!("playback: frame renderer init failed: {e}");
+                    let _ = app.emit(
+                        "playback:state",
+                        PlaybackStateEvent {
+                            playing: false,
+                            time_secs: start_secs,
+                        },
+                    );
+                    let _ = app.emit(
+                        "playback:error",
+                        PlaybackErrorEvent {
+                            message: format!("Could not start playback: {e}"),
+                        },
+                    );
+                    return;
+                }
+            },
         }
     };
 
@@ -317,6 +458,8 @@ fn run_playback_loop(
         );
     };
 
+    let mut perf = PerfAccumulator::default();
+
     'restart: loop {
         if stop.load(Ordering::SeqCst) != 0 {
             finish(start_secs);
@@ -327,9 +470,11 @@ fn run_playback_loop(
             return;
         }
 
-        // Pre-mix timeline audio ONCE for [start_secs, duration) — a single ffmpeg
-        // filtergraph, not one spawn per playback chunk — so the loop below only ever
-        // reads from an already-rendered file via the audio clock.
+        // A6: premix audio in ~5s chunks so playback can start after the first chunk
+        // (~100–300 ms) instead of waiting on the entire remaining timeline. Chunk 0 is
+        // mixed on this thread; later chunks are mixed on a background worker and
+        // appended to the same rodio Sink (still the master clock via get_pos()).
+        const AUDIO_CHUNK_SECS: f64 = 5.0;
         let audio_dir =
             std::env::temp_dir().join(format!("renderly-playback-{}", uuid::Uuid::new_v4()));
         let _ = std::fs::create_dir_all(&audio_dir);
@@ -337,12 +482,16 @@ fn run_playback_loop(
         // also covers a panic unwinding through this scope (e.g. a wgpu validation panic
         // inside `renderer.render`), which none of the manual call sites could.
         let _audio_dir_guard = TempDirGuard(audio_dir.clone());
-        let audio_wav = audio_dir.join("audio.wav");
+
+        let remaining = (duration - start_secs).max(0.0);
+        let first_chunk = remaining.min(AUDIO_CHUNK_SECS);
+        let first_wav = audio_dir.join("audio_0.wav");
+        let project_snap = project.lock().clone();
         let has_audio = match mix_timeline_audio_range_to_file(
-            &project,
+            &project_snap,
             start_secs,
-            duration - start_secs,
-            &audio_wav,
+            first_chunk,
+            &first_wav,
         ) {
             Ok(v) => v,
             Err(e) => {
@@ -355,13 +504,53 @@ fn run_playback_loop(
         let sink = stream.as_ref().map(|s| Sink::connect_new(s.mixer()));
         if has_audio {
             if let Some(sink) = &sink {
-                if let Ok(file) = File::open(&audio_wav) {
+                if let Ok(file) = File::open(&first_wav) {
                     if let Ok(decoder) = Decoder::new_wav(BufReader::new(file)) {
                         sink.append(decoder);
                     }
                 }
             }
         }
+
+        // Background premix for chunks after the first. Cancelled when this restart
+        // scope ends (seek / stop / end) by dropping `audio_rx` so `send` fails.
+        let (audio_tx, audio_rx) = std::sync::mpsc::channel::<std::path::PathBuf>();
+        let audio_worker = if has_audio && remaining > first_chunk {
+            let dir = audio_dir.clone();
+            let stop_flag = Arc::clone(&stop);
+            Some(thread::spawn(move || {
+                let mut chunk_start = start_secs + first_chunk;
+                let mut idx = 1u32;
+                while chunk_start < duration - 1e-6 {
+                    if stop_flag.load(Ordering::SeqCst) != 0 {
+                        break;
+                    }
+                    let chunk_len = (duration - chunk_start).min(AUDIO_CHUNK_SECS);
+                    let path = dir.join(format!("audio_{idx}.wav"));
+                    match mix_timeline_audio_range_to_file(
+                        &project_snap,
+                        chunk_start,
+                        chunk_len,
+                        &path,
+                    ) {
+                        Ok(true) => {
+                            if audio_tx.send(path).is_err() {
+                                break; // playback restarted or stopped
+                            }
+                        }
+                        Ok(false) => break,
+                        Err(e) => {
+                            eprintln!("playback: audio chunk {idx} premix failed: {e}");
+                            break;
+                        }
+                    }
+                    chunk_start += chunk_len;
+                    idx += 1;
+                }
+            }))
+        } else {
+            None
+        };
 
         let wall_clock_start = Instant::now();
         let mut last_tick_emit = Instant::now() - TICK_INTERVAL;
@@ -373,8 +562,23 @@ fn run_playback_loop(
                 if let Some(sink) = &sink {
                     sink.stop();
                 }
+                drop(audio_rx);
+                if let Some(h) = audio_worker {
+                    let _ = h.join();
+                }
                 finish(*current_time.lock());
                 return;
+            }
+
+            // Drain any finished background audio chunks onto the sink.
+            if let Some(sink) = &sink {
+                while let Ok(path) = audio_rx.try_recv() {
+                    if let Ok(file) = File::open(&path) {
+                        if let Ok(decoder) = Decoder::new_wav(BufReader::new(file)) {
+                            sink.append(decoder);
+                        }
+                    }
+                }
             }
 
             // `seek.lock()` as its own statement, NOT the `if let` scrutinee directly —
@@ -388,6 +592,10 @@ fn run_playback_loop(
             if let Some(new_time) = pending_seek {
                 if let Some(sink) = &sink {
                     sink.stop();
+                }
+                drop(audio_rx);
+                if let Some(h) = audio_worker {
+                    let _ = h.join();
                 }
                 start_secs = new_time.clamp(0.0, duration.max(0.0));
                 let _ = app.emit(
@@ -413,45 +621,98 @@ fn run_playback_loop(
                 if let Some(sink) = &sink {
                     sink.stop();
                 }
+                drop(audio_rx);
+                if let Some(h) = audio_worker {
+                    let _ = h.join();
+                }
                 finish(duration.max(0.0));
                 return;
             }
 
             *current_time.lock() = t;
 
-            match renderer.render(&project, t) {
-                Ok(pixels) => {
-                    let state = app.state::<crate::AppState>();
-                    let result =
-                        state
+            let frame_start = Instant::now();
+            if gpu_present {
+                match renderer.render_to_texture(&project.lock(), t) {
+                    Ok(timing) => {
+                        let state = app.state::<crate::AppState>();
+                        let present_start = Instant::now();
+                        let result = state
                             .preview
                             .lock()
-                            .present_rgba(&pixels, settings.width, settings.height);
-                    if let Err(e) = result {
-                        eprintln!("playback: present failed at {t:.3}s: {e}");
+                            .present_texture_view(renderer.output_view());
+                        let present_ms = present_start.elapsed().as_secs_f64() * 1000.0;
+                        if let Err(e) = result {
+                            eprintln!("playback: present failed at {t:.3}s: {e}");
+                            if last_error_emit.elapsed() >= Duration::from_secs(2) {
+                                let _ = app.emit(
+                                    "playback:error",
+                                    PlaybackErrorEvent {
+                                        message: format!("Preview present failed: {e}"),
+                                    },
+                                );
+                                last_error_emit = Instant::now();
+                            }
+                        }
+                        let frame_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
+                        perf.record(timing, present_ms, frame_ms);
+                    }
+                    Err(e) => {
+                        eprintln!("playback: render failed at {t:.3}s: {e}");
                         if last_error_emit.elapsed() >= Duration::from_secs(2) {
                             let _ = app.emit(
                                 "playback:error",
                                 PlaybackErrorEvent {
-                                    message: format!("Preview present failed: {e}"),
+                                    message: format!("Playback render failed: {e}"),
                                 },
                             );
                             last_error_emit = Instant::now();
                         }
                     }
                 }
-                Err(e) => {
-                    eprintln!("playback: render failed at {t:.3}s: {e}");
-                    if last_error_emit.elapsed() >= Duration::from_secs(2) {
-                        let _ = app.emit(
-                            "playback:error",
-                            PlaybackErrorEvent {
-                                message: format!("Playback render failed: {e}"),
-                            },
+            } else {
+                match renderer.render_timed(&project.lock(), t) {
+                    Ok((pixels, timing)) => {
+                        let state = app.state::<crate::AppState>();
+                        let present_start = Instant::now();
+                        let result = state.preview.lock().present_rgba(
+                            &pixels,
+                            settings.width,
+                            settings.height,
                         );
-                        last_error_emit = Instant::now();
+                        let present_ms = present_start.elapsed().as_secs_f64() * 1000.0;
+                        if let Err(e) = result {
+                            eprintln!("playback: present failed at {t:.3}s: {e}");
+                            if last_error_emit.elapsed() >= Duration::from_secs(2) {
+                                let _ = app.emit(
+                                    "playback:error",
+                                    PlaybackErrorEvent {
+                                        message: format!("Preview present failed: {e}"),
+                                    },
+                                );
+                                last_error_emit = Instant::now();
+                            }
+                        }
+                        let frame_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
+                        perf.record(timing, present_ms, frame_ms);
+                    }
+                    Err(e) => {
+                        eprintln!("playback: render failed at {t:.3}s: {e}");
+                        if last_error_emit.elapsed() >= Duration::from_secs(2) {
+                            let _ = app.emit(
+                                "playback:error",
+                                PlaybackErrorEvent {
+                                    message: format!("Playback render failed: {e}"),
+                                },
+                            );
+                            last_error_emit = Instant::now();
+                        }
                     }
                 }
+            }
+
+            if let Some(event) = perf.maybe_drain() {
+                let _ = app.emit("playback:perf", event);
             }
 
             if last_tick_emit.elapsed() >= TICK_INTERVAL {
@@ -471,7 +732,8 @@ fn run_playback_loop(
 }
 
 fn run_scrub_worker(pending: Arc<Mutex<Option<ScrubRequest>>>, play_epoch: Arc<AtomicU64>) {
-    let mut cached: Option<(ExportSettings, DecodeOptions, FrameRenderer)> = None;
+    // (settings, decode_opts, renderer, gpu_present)
+    let mut cached: Option<(ExportSettings, DecodeOptions, FrameRenderer, bool)> = None;
 
     loop {
         let request = pending.lock().take();
@@ -487,12 +749,31 @@ fn run_scrub_worker(pending: Arc<Mutex<Option<ScrubRequest>>>, play_epoch: Arc<A
         }
 
         let needs_new = match &cached {
-            Some((s, d, _)) => *s != req.settings || *d != req.decode_opts,
+            Some((s, d, _, _)) => *s != req.settings || *d != req.decode_opts,
             None => true,
         };
         if needs_new {
-            match FrameRenderer::new(req.settings, req.decode_opts) {
-                Ok(r) => cached = Some((req.settings, req.decode_opts, r)),
+            let shared = req
+                .app
+                .state::<crate::AppState>()
+                .preview
+                .lock()
+                .shared_device();
+            let built = match shared {
+                Some((device, queue)) => {
+                    FrameRenderer::with_device(device, queue, req.settings, req.decode_opts)
+                        .map(|r| (r, true))
+                        .or_else(|e| {
+                            eprintln!(
+                                "scrub: shared-device renderer init failed ({e}); falling back"
+                            );
+                            FrameRenderer::new(req.settings, req.decode_opts).map(|r| (r, false))
+                        })
+                }
+                None => FrameRenderer::new(req.settings, req.decode_opts).map(|r| (r, false)),
+            };
+            match built {
+                Ok((r, gpu)) => cached = Some((req.settings, req.decode_opts, r, gpu)),
                 Err(e) => {
                     eprintln!("scrub: frame renderer init failed: {e}");
                     continue;
@@ -500,26 +781,54 @@ fn run_scrub_worker(pending: Arc<Mutex<Option<ScrubRequest>>>, play_epoch: Arc<A
             }
         }
 
-        let (_, _, renderer) = cached.as_mut().expect("just populated above");
-        match renderer.render(&req.project, req.time_secs) {
-            Ok(pixels) => {
-                // Re-check: `render` above is a real decode, not instantaneous — `play()`
-                // can start while it was in flight. Presenting after that would overwrite
-                // a live playback frame with this now-stale scrub frame.
-                if req.epoch != play_epoch.load(Ordering::SeqCst) {
+        let (_, _, renderer, gpu_present) = cached.as_mut().expect("just populated above");
+        let present_ok = if *gpu_present {
+            match renderer.render_to_texture(&req.project, req.time_secs) {
+                Ok(_) => {
+                    if req.epoch != play_epoch.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    let state = req.app.state::<crate::AppState>();
+                    let result = state
+                        .preview
+                        .lock()
+                        .present_texture_view(renderer.output_view());
+                    result
+                }
+                Err(e) => {
+                    eprintln!("scrub: render failed at {:.3}s: {e}", req.time_secs);
                     continue;
                 }
-                let state = req.app.state::<crate::AppState>();
-                let result = state.preview.lock().present_rgba(
-                    &pixels,
-                    req.settings.width,
-                    req.settings.height,
-                );
-                if let Err(e) = result {
-                    eprintln!("scrub: present failed at {:.3}s: {e}", req.time_secs);
+            }
+        } else {
+            match renderer.render(&req.project, req.time_secs) {
+                Ok(pixels) => {
+                    if req.epoch != play_epoch.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    let state = req.app.state::<crate::AppState>();
+                    let result = state.preview.lock().present_rgba(
+                        &pixels,
+                        req.settings.width,
+                        req.settings.height,
+                    );
+                    result
+                }
+                Err(e) => {
+                    eprintln!("scrub: render failed at {:.3}s: {e}", req.time_secs);
+                    continue;
                 }
             }
-            Err(e) => eprintln!("scrub: render failed at {:.3}s: {e}", req.time_secs),
+        };
+        if let Err(e) = present_ok {
+            eprintln!("scrub: present failed at {:.3}s: {e}", req.time_secs);
+        } else if pending.lock().is_none() && req.epoch == play_epoch.load(Ordering::SeqCst) {
+            // A5: warm decode LRU ±0.5s while the user is paused on this scrub
+            // position — next nearby scrub (especially reverse) hits cache.
+            let (_, _, renderer, _) = cached.as_mut().expect("renderer still cached");
+            if let Err(e) = renderer.prefetch_around(&req.project, req.time_secs, 0.5) {
+                eprintln!("scrub: prefetch failed at {:.3}s: {e}", req.time_secs);
+            }
         }
 
         if req.with_audio_blip {

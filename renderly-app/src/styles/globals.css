@@ -153,7 +153,7 @@ body {
 
 .window-ctrl-close:hover {
   background: var(--danger);
-  color: #fff;
+  color: var(--text-1);
 }
 
 .btn-lucide {
@@ -330,6 +330,13 @@ body {
 .project-chip.live .dot {
   background: var(--success);
   box-shadow: 0 0 8px var(--success);
+}
+
+.project-chip .save-status {
+  margin-left: var(--space-1);
+  color: var(--text-3);
+  font-size: var(--fs-11);
+  flex-shrink: 0;
 }
 
 /* —— Tooltips (custom; never use native title) —— */
@@ -642,6 +649,34 @@ body {
   color: var(--text-3);
 }
 
+/* G3: CapCut-style import-first emphasis when the media bin is empty. */
+.panel-body.media-import-first .drop-zone-hero {
+  min-height: 140px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem 1rem;
+  border-width: 2px;
+}
+
+.media-thumb.waveform-thumb {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 1px;
+  padding: 4px 3px;
+  overflow: hidden;
+}
+
+.media-thumb.waveform-thumb span {
+  flex: 1;
+  min-width: 1px;
+  background: var(--clip-audio);
+  border-radius: 1px;
+  opacity: 0.85;
+}
+
 .media-item {
   display: flex;
   align-items: center;
@@ -742,14 +777,14 @@ body {
   display: flex;
   flex-direction: column;
   min-height: 0;
-  background: #000;
+  background: var(--neutral-950);
 }
 
 .preview-host {
   position: relative;
   flex: 1;
   min-height: 0;
-  background: radial-gradient(ellipse at center, #121214 0%, #050506 72%);
+  background: radial-gradient(ellipse at center, var(--neutral-900) 0%, var(--neutral-950) 72%);
 }
 
 .preview-handles-overlay {
@@ -767,15 +802,15 @@ body {
 }
 
 .preview-mask-outline {
-  fill: rgba(90, 180, 255, 0.08);
-  stroke: #5ab4ff;
+  fill: color-mix(in srgb, var(--accent) 8%, transparent);
+  stroke: var(--accent);
   stroke-width: 1.5;
   stroke-dasharray: 5 3;
 }
 
 .preview-mask-knob {
-  fill: #1a1a1c;
-  stroke: #5ab4ff;
+  fill: var(--neutral-900);
+  stroke: var(--accent);
   stroke-width: 1.5;
   cursor: nwse-resize;
 }
@@ -788,7 +823,7 @@ body {
   padding: 4px 10px;
   border-radius: 4px;
   background: rgba(10, 10, 12, 0.72);
-  color: var(--text-2, #c8c8cc);
+  color: var(--text-2);
   font-size: 11px;
   white-space: nowrap;
   pointer-events: none;
@@ -800,21 +835,21 @@ body {
 }
 
 .preview-handle-box {
-  fill: rgba(232, 93, 58, 0.06);
-  stroke: var(--accent, #e85d3a);
+  fill: color-mix(in srgb, var(--accent) 6%, transparent);
+  stroke: var(--accent);
   stroke-width: 1.5;
   stroke-dasharray: 4 3;
 }
 
 .preview-handle-rot-line {
-  stroke: var(--accent, #e85d3a);
+  stroke: var(--accent);
   stroke-width: 1;
   opacity: 0.7;
 }
 
 .preview-handle-knob {
-  fill: #1a1a1c;
-  stroke: var(--accent, #e85d3a);
+  fill: var(--neutral-900);
+  stroke: var(--accent);
   stroke-width: 1.5;
   cursor: nwse-resize;
 }
@@ -861,7 +896,7 @@ body {
   position: fixed;
   inset: 0;
   z-index: 200;
-  background: #000;
+  background: var(--neutral-950);
 }
 
 .preview-column.preview-fullscreen .preview-host {
@@ -894,6 +929,42 @@ body {
   to {
     transform: rotate(360deg);
   }
+}
+
+/* Perf HUD (A0) — Ctrl/Cmd+Shift+P, see components/preview/PerfHud.tsx */
+.perf-hud {
+  position: absolute;
+  top: var(--space-2);
+  right: var(--space-2);
+  z-index: 10;
+  min-width: 130px;
+  padding: var(--space-2) var(--space-3);
+  background: rgba(10, 10, 11, 0.72);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-m);
+  font-family: "SF Mono", "Cascadia Code", Consolas, monospace;
+  font-size: var(--fs-11);
+  color: var(--text-2);
+  pointer-events: none;
+  backdrop-filter: blur(4px);
+}
+
+.perf-hud-title {
+  color: var(--text-3);
+  margin-bottom: var(--space-1);
+  letter-spacing: 0.02em;
+}
+
+.perf-hud-row {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-3);
+  color: var(--text-1);
+  line-height: 1.5;
+}
+
+.perf-hud-row span:first-child {
+  color: var(--text-3);
 }
 
 .play-btn.pulse-once {
@@ -984,7 +1055,7 @@ body {
 
 .play-btn.playing {
   background: var(--danger);
-  color: #2a0a0a;
+  color: var(--neutral-950);
 }
 
 /* —— Inspector —— */
@@ -1033,12 +1104,12 @@ body {
   padding: 0;
   border: none;
   border-radius: 2px;
-  background: var(--accent, #e85d3a);
+  background: var(--accent);
   cursor: pointer;
 }
 
 .keyframe-mark.selected {
-  outline: 2px solid #fff;
+  outline: 2px solid var(--text-1);
 }
 
 .keyframe-list {
@@ -1408,6 +1479,20 @@ body {
   cursor: crosshair;
 }
 
+/* Playhead + snap guide only (see renderer.ts's `renderTimelineOverlay`) — stacked
+   directly on top of #timeline so their high-frequency repaints during playback/scrub
+   never touch the (much more expensive) clip/thumbnail/waveform canvas underneath.
+   Deliberately no explicit z-index: DOM order alone (right after #timeline, before
+   .track-headers below) puts it above the main canvas but still under the real
+   track-header controls and the "timeline is empty" message. */
+#timeline-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
 /* —— Track headers (DOM overlay on the canvas's TRACK_LABEL_W gutter) —— */
 .track-headers {
   position: absolute;
@@ -1530,7 +1615,7 @@ body {
   background: var(--bg-3);
 }
 
-/* —— Welcome —— */
+/* —— Welcome / project home (G1) —— */
 .welcome-screen {
   position: fixed;
   inset: 0;
@@ -1541,16 +1626,45 @@ body {
     radial-gradient(ellipse 80% 50% at 50% 0%, rgba(255, 90, 61, 0.08), transparent 55%),
     rgba(10, 10, 11, 0.94);
   backdrop-filter: blur(16px);
+  overflow: auto;
+  padding: var(--space-6);
 }
 
 .welcome-screen.hidden {
   display: none;
 }
 
-.welcome-card {
-  text-align: center;
-  max-width: 400px;
-  padding: 2rem 1.5rem;
+.welcome-home {
+  width: min(960px, 100%);
+}
+
+.welcome-home-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  margin-bottom: var(--space-6);
+}
+
+.welcome-home-header .welcome-brand {
+  margin: 0;
+  flex-shrink: 0;
+}
+
+.welcome-home-header h1 {
+  margin: 0;
+  font-size: 1.65rem;
+  font-weight: 700;
+  letter-spacing: -0.04em;
+}
+
+.welcome-home-header .welcome-lead {
+  margin: 0.15rem 0 0;
+}
+
+.welcome-home-actions {
+  margin-left: auto;
+  display: flex;
+  gap: var(--space-2);
 }
 
 .welcome-brand {
@@ -1561,14 +1675,6 @@ body {
   color: var(--accent);
   display: grid;
   place-items: center;
-  margin: 0 auto 1.25rem;
-}
-
-.welcome-card h1 {
-  margin: 0 0 0.5rem;
-  font-size: 1.65rem;
-  font-weight: 700;
-  letter-spacing: -0.04em;
 }
 
 .welcome-lead {
@@ -1578,18 +1684,126 @@ body {
   font-size: var(--fs-13);
 }
 
-.welcome-actions {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  align-items: stretch;
+.welcome-empty,
+.welcome-empty-card {
+  text-align: center;
+  color: var(--text-2);
+  padding: 2rem;
 }
 
-.welcome-actions .btn,
-.welcome-actions .btn-primary,
-.welcome-actions .btn-ghost {
-  width: 100%;
+.welcome-empty-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-3);
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-l);
+  max-width: 360px;
+  margin: 0 auto;
+}
+
+.project-gallery {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: var(--space-3);
+}
+
+.project-card {
+  position: relative;
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-l);
+  overflow: hidden;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.project-card:hover {
+  border-color: var(--border-strong);
+  background: var(--bg-2);
+}
+
+.project-card-new {
+  min-height: 200px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
   justify-content: center;
+  gap: var(--space-2);
+  width: 100%;
+  color: var(--text-2);
+  background: transparent;
+  border: 1.5px dashed var(--border-strong);
+  border-radius: var(--radius-l);
+  cursor: pointer;
+}
+
+.project-card-new:hover {
+  border-color: var(--accent);
+  color: var(--text-1);
+  background: var(--accent-soft);
+}
+
+.project-card-main {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.project-card-thumb {
+  aspect-ratio: 9 / 16;
+  max-height: 160px;
+  background: var(--bg-3);
+}
+
+.project-card-meta {
+  padding: var(--space-2) var(--space-3) var(--space-3);
+}
+
+.project-card-meta .name {
+  font-size: var(--fs-13);
+  font-weight: 600;
+  color: var(--text-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.project-card-meta .sub {
+  font-size: var(--fs-11);
+  color: var(--text-3);
+  margin-top: 2px;
+}
+
+.project-card-delete {
+  position: absolute;
+  top: var(--space-2);
+  right: var(--space-2);
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-s);
+  border: none;
+  background: rgba(0, 0, 0, 0.55);
+  color: var(--text-2);
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+
+.project-card:hover .project-card-delete {
+  opacity: 1;
+}
+
+.project-card-delete:hover {
+  color: var(--text-1);
+  background: rgba(180, 40, 40, 0.85);
 }
 
 /* —— Dialogs —— */
@@ -1665,6 +1879,29 @@ dialog .dialog-sub {
   color: var(--text-3);
 }
 
+.export-encode-options {
+  display: grid;
+  gap: var(--space-2);
+  margin: 0.85rem 0 0.25rem;
+}
+
+.export-encode-options .field {
+  margin-bottom: 0;
+}
+
+.export-encode-options .field-hint {
+  color: var(--text-3);
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.export-encode-options input[type="range"] {
+  width: 100%;
+  padding: 0;
+  accent-color: var(--accent);
+}
+
 .export-progress {
   height: 8px;
   border-radius: 999px;
@@ -1689,7 +1926,7 @@ dialog .dialog-sub {
 }
 
 .export-error {
-  color: var(--danger, #f87171);
+  color: var(--danger);
 }
 
 dialog menu {

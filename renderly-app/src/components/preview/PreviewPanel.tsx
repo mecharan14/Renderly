@@ -5,6 +5,7 @@ import * as ipc from "../../lib/ipc";
 import { TransportBar } from "./TransportBar";
 import { PreviewHandlesOverlay } from "./PreviewHandlesOverlay";
 import { PreviewMaskOverlay } from "./PreviewMaskOverlay";
+import { PerfHud } from "./PerfHud";
 
 /// Fits the project's aspect ratio inside the host, letterboxed, and sends that sub-rect
 /// (not the full host rect) to the backend — the native wgpu child window is sized to
@@ -167,6 +168,7 @@ export function PreviewPanel() {
             <PreviewMaskOverlay hostRef={hostRef} aspect={aspect} />
           </>
         ) : null}
+        <PerfHud />
       </section>
       <TransportBar
         fullscreen={fullscreen}

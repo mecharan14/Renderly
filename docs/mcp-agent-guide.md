@@ -25,6 +25,20 @@ Configure in Cursor / Claude Desktop MCP settings:
 
 Logging goes to **stderr**; stdout is reserved for MCP JSON-RPC.
 
+## Live desktop bridge (E1/E2)
+
+When `renderly-app` is running, it publishes a discovery file and a loopback WebSocket
+JSON-RPC server — see [bridge-protocol.md](bridge-protocol.md). `renderly-mcp` prefers that
+bridge for `get_project`, `apply_command`, `export`, and `render_frame` when the open project
+path matches; otherwise it keeps today's headless file mode.
+
+| Tool | Description |
+|---|---|
+| `get_editor_status` | `{ live, project_path, playhead, selection, … }` — whether the desktop app is connected |
+
+Agent edits over the bridge share the app's undo stack (Ctrl+Z undoes agent changes) and
+emit `project:changed` so the GUI updates live.
+
 ## Environment
 
 | Variable | Purpose |

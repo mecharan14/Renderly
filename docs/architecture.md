@@ -264,8 +264,9 @@ whole-project mutation is now fully serialized, not just "usually fine because i
 
 **Session-lock discipline.** `AppState::commit_project` is the only way any of the above
 write a project back into the session: it holds `session`'s lock just long enough to swap
-in the new `Project` and read the save path, then does the actual serialize+`fs::write` in
-`spawn_blocking`, outside any lock. This matters because `session`'s lock is also what
+in the new `Arc<Project>` and read the save path, then does the actual serialize+`fs::write`
+in `spawn_blocking`, outside any lock. Play/seek/refresh take `Arc::clone` of that snapshot
+(no deep clone). This matters because `session`'s lock is also what
 `play`/`seek`/`scrub_audio`/`get_project` need — a blocking disk write held under that lock
 (the previous behavior) stalls all of those behind every single edit's save.
 
@@ -285,21 +286,22 @@ in the new `Project` and read the save path, then does the actual serialize+`fs:
 
 | Command | Notes |
 |---|---|
-| `quick_start_project` / `new_project` / `open_project` / `save_project` / `get_project` | Session I/O; clears history on open/new/quick-start |
-| `apply_command` / `apply_commands` | Core edits; `apply_commands` is one undo snapshot |
-| `undo` / `redo` | Session snapshot stacks (see Undo/redo) |
+| `quick_start_project` / `new_project` / `open_project` / `save_project` / `get_project` | Session I/O; clears history on open/new/quick-start; `get_project` returns `{ project, revision }` |
+| `apply_command` / `apply_commands` | Core edits; `apply_commands` is one undo snapshot; both return `{ revision, patch, outcome(s) }` (RFC-6902 JSON Patch — app IPC only, not part of the core `Command` enum) |
+| `undo` / `redo` | Session snapshot stacks (see Undo/redo); return `{ can_undo, can_redo, revision, patch }` |
 | `export_project` / `cancel_export` | Progress via `export:progress`; clones project, no `edit_lock` |
-| `play` / `pause` / `seek` / `scrub_audio` | PlaybackEngine worker |
+| `play` / `pause` / `seek` / `scrub_audio` | PlaybackEngine worker; play/seek/scrub take `Arc<Project>` snapshots |
 | `set_preview_bounds` | **Sync** — creates/resizes native preview HWND on the UI thread |
 | `request_media_assets` / `get_media_assets` | Thumbnail/waveform cache |
 
 Mutating GUI edits pause playback first (CapCut-style) so decoders and audio don't race the
 new project state.
 
-`project:changed` doesn't carry the project itself — the frontend refetches via
-`get_project` on receipt, so it's the single source of truth for "something changed,
-re-read state," regardless of whether the mutation came from the user's own `apply_command`
-call or from undo/redo.
+`project:changed` carries `{ revision, can_undo, can_redo, mutation_id? }` but not the project
+body or a patch. The frontend applies the patch returned by its own `apply_command` /
+`apply_commands` / `undo` / `redo` invoke (B3), and only full-fetches via `get_project` for
+external writers (MCP bridge with no matching `mutation_id`) or on patch-apply failure /
+revision gap.
 
 ### Media assets (thumbnails + waveforms, M4)
 

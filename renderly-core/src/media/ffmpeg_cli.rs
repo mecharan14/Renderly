@@ -412,6 +412,52 @@ pub fn generate_thumbnail_strip(
     })
 }
 
+/// Hardware decode backends to probe for, in priority order. Vendor-specific backends
+/// (`cuda`, `qsv`) come first only because they're typically faster when their GPU is
+/// actually present; `d3d11va` works across GPU vendors on Windows via Direct3D 11 and is
+/// the broad fallback before giving up on a *named* backend.
+const HWACCEL_CANDIDATES: &[&str] = &["cuda", "qsv", "d3d11va"];
+
+static COMPILED_HWACCELS: OnceLock<Vec<String>> = OnceLock::new();
+/// Whether a probed hwaccel actually produced a usable frame, cached for the rest of the
+/// process after the first `VideoReader::open_with` call — see its doc comment.
+static HWACCEL_WORKS: OnceLock<bool> = OnceLock::new();
+
+/// Hardware accel names this `ffmpeg` binary was compiled with (`ffmpeg -hwaccels`).
+/// Compile-time support only — doesn't mean a usable GPU/driver is actually present;
+/// `open_with`'s warm-up read is what actually verifies a candidate works at runtime.
+fn compiled_hwaccels() -> &'static [String] {
+    COMPILED_HWACCELS.get_or_init(|| {
+        let Ok(ffmpeg) = ffmpeg_path() else {
+            return Vec::new();
+        };
+        let Ok(output) = Command::new(ffmpeg)
+            .args(["-hide_banner", "-hwaccels"])
+            .output()
+        else {
+            return Vec::new();
+        };
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .skip(1) // "Hardware acceleration methods:" header line.
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    })
+}
+
+/// First `HWACCEL_CANDIDATES` entry this ffmpeg was compiled with, else `"auto"` — ffmpeg
+/// resolves `-hwaccel auto` to whatever it can use, or silently stays on software decode,
+/// so it's always safe to *try* even when we can't tell in advance if it'll help.
+fn preferred_hwaccel() -> &'static str {
+    let compiled = compiled_hwaccels();
+    HWACCEL_CANDIDATES
+        .iter()
+        .find(|c| compiled.iter().any(|line| line == *c))
+        .copied()
+        .unwrap_or("auto")
+}
+
 /// Sequential RGBA frame reader backed by a long-lived `ffmpeg` decode pipe.
 pub struct VideoReader {
     child: Child,
@@ -419,6 +465,10 @@ pub struct VideoReader {
     width: u32,
     height: u32,
     frame_bytes: usize,
+    /// A3: the warm-up frame `open_with` already decoded to confirm a hwaccel attempt
+    /// actually works, handed back on the caller's first `read_frame()` instead of being
+    /// discarded and re-decoded.
+    pending_first_frame: Option<RgbaFrame>,
 }
 
 type ChildStdout = std::process::ChildStdout;
@@ -428,10 +478,60 @@ impl VideoReader {
         Self::open_with(path, start_secs, &ReaderOptions::default())
     }
 
+    /// A3: hardware decode via `-hwaccel`, probed once per process and cached.
+    ///
+    /// The *first* `VideoReader` opened in the process's lifetime pays the cost of
+    /// actually trying hardware decode: spawn ffmpeg with the best compiled-in candidate
+    /// (or `auto`), decode one real frame as a warm-up/health check, and remember the
+    /// outcome in `HWACCEL_WORKS`. Every subsequent open in this process just replays that
+    /// cached decision instead of re-probing — hwaccel failures are systemic (missing
+    /// driver/codec support), not per-file, so re-attempting per open would only add
+    /// latency to every single decoder spawn (every seek, scrub, and clip change) for no
+    /// benefit.
+    ///
+    /// If the cached/attempted hwaccel run fails to produce a first frame, this falls
+    /// back to a fresh software-only spawn transparently — callers never see the
+    /// difference beyond decode running on the CPU instead of the GPU.
     pub fn open_with(
         path: &Path,
         start_secs: f64,
         opts: &ReaderOptions,
+    ) -> Result<Self, FfmpegCliError> {
+        match HWACCEL_WORKS.get().copied() {
+            // Already confirmed working earlier this process — use it directly, no
+            // per-open warm-up/verification cost.
+            Some(true) => return Self::spawn(path, start_secs, opts, Some(preferred_hwaccel())),
+            // Already confirmed broken earlier this process — don't pay to re-try it.
+            Some(false) => return Self::spawn(path, start_secs, opts, None),
+            // First open this process: probe it once, verified by an actual decode.
+            None => {}
+        }
+
+        let accel = preferred_hwaccel();
+        match Self::spawn(path, start_secs, opts, Some(accel)) {
+            Ok(mut reader) => match reader.read_frame_from_pipe() {
+                Ok(Some(frame)) => {
+                    let _ = HWACCEL_WORKS.set(true);
+                    reader.pending_first_frame = Some(frame);
+                    return Ok(reader);
+                }
+                _ => {
+                    let _ = HWACCEL_WORKS.set(false);
+                    // `reader` drops here — its `Drop` impl kills the failed child.
+                }
+            },
+            Err(_) => {
+                let _ = HWACCEL_WORKS.set(false);
+            }
+        }
+        Self::spawn(path, start_secs, opts, None)
+    }
+
+    fn spawn(
+        path: &Path,
+        start_secs: f64,
+        opts: &ReaderOptions,
+        hwaccel: Option<&str>,
     ) -> Result<Self, FfmpegCliError> {
         let probed = probe_video(path)?;
         let (width, height) = scaled_dimensions(probed.width, probed.height, opts.target_height);
@@ -445,11 +545,13 @@ impl VideoReader {
             // deadlock (see `drain_stderr`).
             "-loglevel",
             "fatal",
-            "-ss",
-            &format!("{start_secs:.6}"),
-            "-i",
-        ])
-        .arg(path);
+        ]);
+        // Must precede `-i` — ffmpeg only applies `-hwaccel` to inputs opened after it.
+        if let Some(accel) = hwaccel {
+            cmd.args(["-hwaccel", accel]);
+        }
+        cmd.args(["-ss", &format!("{start_secs:.6}"), "-i"])
+            .arg(path);
         if let Some(fps) = opts.output_fps {
             cmd.args(["-r", &format!("{fps:.6}")]);
         }
@@ -492,6 +594,7 @@ impl VideoReader {
             width,
             height,
             frame_bytes,
+            pending_first_frame: None,
         })
     }
 
@@ -504,6 +607,13 @@ impl VideoReader {
     }
 
     pub fn read_frame(&mut self) -> Result<Option<RgbaFrame>, FfmpegCliError> {
+        if let Some(frame) = self.pending_first_frame.take() {
+            return Ok(Some(frame));
+        }
+        self.read_frame_from_pipe()
+    }
+
+    fn read_frame_from_pipe(&mut self) -> Result<Option<RgbaFrame>, FfmpegCliError> {
         let mut buf = vec![0u8; self.frame_bytes];
         match self.stdout.read_exact(&mut buf) {
             Ok(()) => Ok(Some(RgbaFrame {
@@ -524,6 +634,139 @@ impl Drop for VideoReader {
     }
 }
 
+/// A8: which H.264 encoder to try for export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoEncoderPreference {
+    /// Probe NVENC/QSV then fall back to libx264 (default).
+    #[default]
+    Auto,
+    /// Force software H.264 (`libx264`).
+    Software,
+    /// Prefer `h264_nvenc` (falls back to software if unavailable).
+    Nvenc,
+    /// Prefer `h264_qsv` (falls back to software if unavailable).
+    Qsv,
+}
+
+/// Parameters for [`VideoEncoder::open`].
+#[derive(Debug, Clone, Copy)]
+pub struct VideoEncodeConfig {
+    pub width: u32,
+    pub height: u32,
+    pub fps: f64,
+    pub preference: VideoEncoderPreference,
+    pub crf: u8,
+}
+
+static COMPILED_ENCODERS: OnceLock<Vec<String>> = OnceLock::new();
+
+fn compiled_encoders() -> &'static [String] {
+    COMPILED_ENCODERS.get_or_init(|| {
+        let Ok(ffmpeg) = ffmpeg_path() else {
+            return Vec::new();
+        };
+        let Ok(output) = Command::new(ffmpeg)
+            .args(["-hide_banner", "-encoders"])
+            .output()
+        else {
+            return Vec::new();
+        };
+        // Lines look like: " V..... h264_nvenc           NVIDIA NVENC H.264 encoder"
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                let first = line.chars().next()?;
+                if !matches!(first, 'V' | 'A' | 'S') {
+                    return None;
+                }
+                // Six-char capability flags, then whitespace, then encoder name.
+                let rest = line.get(7..)?.trim();
+                rest.split_whitespace().next().map(str::to_string)
+            })
+            .collect()
+    })
+}
+
+fn encoder_available(name: &str) -> bool {
+    compiled_encoders().iter().any(|e| e == name)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolvedVideoCodec {
+    Libx264,
+    H264Nvenc,
+    H264Qsv,
+}
+
+fn resolve_video_encoder(pref: VideoEncoderPreference) -> ResolvedVideoCodec {
+    match pref {
+        VideoEncoderPreference::Software => ResolvedVideoCodec::Libx264,
+        VideoEncoderPreference::Nvenc => {
+            if encoder_available("h264_nvenc") {
+                ResolvedVideoCodec::H264Nvenc
+            } else {
+                ResolvedVideoCodec::Libx264
+            }
+        }
+        VideoEncoderPreference::Qsv => {
+            if encoder_available("h264_qsv") {
+                ResolvedVideoCodec::H264Qsv
+            } else {
+                ResolvedVideoCodec::Libx264
+            }
+        }
+        VideoEncoderPreference::Auto => {
+            if encoder_available("h264_nvenc") {
+                ResolvedVideoCodec::H264Nvenc
+            } else if encoder_available("h264_qsv") {
+                ResolvedVideoCodec::H264Qsv
+            } else {
+                ResolvedVideoCodec::Libx264
+            }
+        }
+    }
+}
+
+fn video_encoder_args(codec: &ResolvedVideoCodec, crf: u8) -> Vec<String> {
+    match codec {
+        ResolvedVideoCodec::Libx264 => vec![
+            "-c:v".into(),
+            "libx264".into(),
+            "-preset".into(),
+            "medium".into(),
+            "-crf".into(),
+            crf.to_string(),
+        ],
+        ResolvedVideoCodec::H264Nvenc => {
+            // Map CRF (~18 default) into NVENC CQ roughly 0–51.
+            let cq = crf.clamp(0, 51);
+            vec![
+                "-c:v".into(),
+                "h264_nvenc".into(),
+                "-preset".into(),
+                "p4".into(),
+                "-rc".into(),
+                "vbr".into(),
+                "-cq".into(),
+                cq.to_string(),
+                "-b:v".into(),
+                "0".into(),
+            ]
+        }
+        ResolvedVideoCodec::H264Qsv => {
+            let global_quality = crf.clamp(1, 51);
+            vec![
+                "-c:v".into(),
+                "h264_qsv".into(),
+                "-global_quality".into(),
+                global_quality.to_string(),
+            ]
+        }
+    }
+}
+
 /// H.264 MP4 encoder that accepts raw RGBA frames on stdin.
 pub struct VideoEncoder {
     child: Child,
@@ -531,31 +774,36 @@ pub struct VideoEncoder {
 }
 
 impl VideoEncoder {
-    pub fn open(
-        output_path: &Path,
-        width: u32,
-        height: u32,
-        fps: f64,
-    ) -> Result<Self, FfmpegCliError> {
-        let mut child = Command::new(ffmpeg_path()?)
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                "rgba",
-                "-s",
-                &format!("{width}x{height}"),
-                "-r",
-                &format!("{fps:.6}"),
-                "-i",
-                "pipe:0",
-                "-an",
-                "-c:v",
-                "libx264",
+    pub fn open(output_path: &Path, config: &VideoEncodeConfig) -> Result<Self, FfmpegCliError> {
+        let width = config.width;
+        let height = config.height;
+        let fps = config.fps;
+        let codec = resolve_video_encoder(config.preference);
+        let mut args: Vec<String> = [
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgba",
+            "-s",
+            &format!("{width}x{height}"),
+            "-r",
+            &format!("{fps:.6}"),
+            "-i",
+            "pipe:0",
+            "-an",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+
+        args.extend(video_encoder_args(&codec, config.crf));
+
+        args.extend(
+            [
                 "-pix_fmt",
                 "yuv420p",
                 // Tag the bitstream so players treat it as BT.709 limited (matches the
@@ -571,7 +819,13 @@ impl VideoEncoder {
                 "tv",
                 "-movflags",
                 "+faststart",
-            ])
+            ]
+            .iter()
+            .map(|s| (*s).to_string()),
+        );
+
+        let mut child = Command::new(ffmpeg_path()?)
+            .args(&args)
             .arg(output_path)
             .stdin(Stdio::piped())
             .stderr(Stdio::piped())
@@ -624,7 +878,9 @@ pub fn mux_video_audio(
     video_path: &Path,
     audio_path: &Path,
     output_path: &Path,
+    audio_bitrate_k: u32,
 ) -> Result<(), FfmpegCliError> {
+    let bitrate = format!("{}k", audio_bitrate_k.max(32));
     let status = Command::new(ffmpeg_path()?)
         .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
         .arg(video_path)
@@ -636,7 +892,7 @@ pub fn mux_video_audio(
             "-c:a",
             "aac",
             "-b:a",
-            "192k",
+            &bitrate,
             "-shortest",
             "-movflags",
             "+faststart",
@@ -987,6 +1243,181 @@ mod scaling_tests {
     fn scaled_dimensions_width_rounds_up_like_ffmpeg_ffalign() {
         let (w, _) = scaled_dimensions(1921, 1081, Some(721));
         assert_eq!(w, 1284);
+    }
+}
+
+#[cfg(test)]
+mod video_reader_tests {
+    use super::{ffmpeg_path, ReaderOptions, VideoReader};
+    use std::process::Command;
+
+    fn ffmpeg_available() -> bool {
+        super::is_available()
+    }
+
+    /// A2: end-to-end guard for the preview-resolution decode path (`playback.rs` now
+    /// passes `target_height` into the *continuous* playback decoder, not just paused
+    /// scrub). `scaled_dimensions_*` in `scaling_tests` only checks the predicted (w, h)
+    /// against the formula on paper; this test decodes a real odd-dimension source
+    /// through a live `VideoReader` (exactly like the playback loop does) and reads every
+    /// frame to EOF. If our predicted `frame_bytes` ever drifted from what ffmpeg's
+    /// `scale=-2:h` actually emits, `read_frame` would desync partway through and either
+    /// error out or silently yield the wrong frame count — both are caught below.
+    #[test]
+    fn reads_exact_frame_count_from_odd_dimension_source_at_downscaled_target() {
+        if !ffmpeg_available() {
+            eprintln!("skipping video reader test: ffmpeg not on PATH");
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("renderly-reader-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let video_path = dir.join("src.mp4");
+
+        let duration_secs = 2u32;
+        let rate = 10u32;
+        let status = Command::new(ffmpeg_path().unwrap())
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("testsrc=duration={duration_secs}:size=322x240:rate={rate}"),
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&video_path)
+            .status()
+            .expect("ffmpeg encode");
+        assert!(status.success());
+
+        let mut reader = VideoReader::open_with(
+            &video_path,
+            0.0,
+            &ReaderOptions {
+                // Odd, unaligned target on purpose — forces both the height align-up and
+                // the `-2` width resolution ffmpeg does internally.
+                target_height: Some(111),
+                output_fps: Some(rate as f64),
+            },
+        )
+        .expect("open reader");
+
+        assert_eq!(reader.height() % 2, 0, "height must be even-aligned");
+        assert_eq!(reader.width() % 2, 0, "width must be even-aligned");
+        assert!(reader.height() < 240, "must actually be downscaled");
+
+        let mut frame_count = 0u32;
+        while let Some(frame) = reader.read_frame().expect("read_frame should not error") {
+            assert_eq!(frame.width, reader.width());
+            assert_eq!(frame.height, reader.height());
+            assert_eq!(
+                frame.pixels.len(),
+                (frame.width * frame.height * 4) as usize
+            );
+            frame_count += 1;
+            // A misaligned byte stream would run away well past the real frame count
+            // before finally erroring or exhausting the pipe; bail out early with a
+            // clear failure rather than looping until some large default timeout.
+            assert!(
+                frame_count <= duration_secs * rate + 2,
+                "read far more frames than the source contains — byte stream is desynced"
+            );
+        }
+
+        assert_eq!(
+            frame_count,
+            duration_secs * rate,
+            "frame count must exactly match source duration*rate — a mismatch means our \
+             predicted frame_bytes disagreed with ffmpeg's actual scale=-2:h output at some \
+             point and the raw pipe desynced"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A3: hardware decode must not change decoded pixel content. `VideoReader::spawn`
+    /// (private, called directly here to bypass the process-wide `HWACCEL_WORKS` cache
+    /// and force each path deterministically) runs the exact same `-vf` color-conversion
+    /// chain regardless of decode backend, so a software decode and a hwaccel decode of
+    /// the same source should agree almost exactly. Skips the comparison (not the whole
+    /// test) if no working hwaccel is available on this machine — this is a correctness
+    /// guard for when hwaccel *is* available, not a guarantee that it always is.
+    #[test]
+    fn hwaccel_decode_matches_software_decode_pixels() {
+        if !ffmpeg_available() {
+            eprintln!("skipping hwaccel comparison test: ffmpeg not on PATH");
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("renderly-hwaccel-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let video_path = dir.join("src.mp4");
+        let status = Command::new(ffmpeg_path().unwrap())
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=1:size=320x240:rate=5",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&video_path)
+            .status()
+            .expect("ffmpeg encode");
+        assert!(status.success());
+
+        let opts = ReaderOptions::default();
+        let mut sw = VideoReader::spawn(&video_path, 0.0, &opts, None).expect("software spawn");
+        let sw_frame = sw
+            .read_frame_from_pipe()
+            .expect("software read")
+            .expect("software frame");
+
+        let accel = super::preferred_hwaccel();
+        let hw_frame = match VideoReader::spawn(&video_path, 0.0, &opts, Some(accel)) {
+            Ok(mut hw) => match hw.read_frame_from_pipe() {
+                Ok(Some(frame)) => frame,
+                _ => {
+                    eprintln!("skipping: hwaccel '{accel}' unavailable on this machine");
+                    std::fs::remove_dir_all(&dir).ok();
+                    return;
+                }
+            },
+            Err(_) => {
+                eprintln!("skipping: hwaccel '{accel}' spawn failed on this machine");
+                std::fs::remove_dir_all(&dir).ok();
+                return;
+            }
+        };
+
+        assert_eq!(sw_frame.width, hw_frame.width);
+        assert_eq!(sw_frame.height, hw_frame.height);
+        assert_eq!(sw_frame.pixels.len(), hw_frame.pixels.len());
+        let max_diff = sw_frame
+            .pixels
+            .iter()
+            .zip(hw_frame.pixels.iter())
+            .map(|(a, b)| (*a as i32 - *b as i32).unsigned_abs())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_diff <= 2,
+            "hwaccel ('{accel}') decode pixels drifted from software by {max_diff} (>2 per channel)"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 

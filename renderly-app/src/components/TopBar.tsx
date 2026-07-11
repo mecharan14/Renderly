@@ -1,6 +1,6 @@
-import { FilePlus, FolderOpen, Save, Undo2, Redo2, Download } from "lucide-react";
+import { FilePlus, FolderOpen, Save, Undo2, Redo2, Download, House } from "lucide-react";
 import { useEditorStore } from "../store/editorStore";
-import { createNewProjectFlow, openExistingProjectFlow } from "../lib/projectFlows";
+import { getAction, invokeAction } from "../lib/actions";
 import { IconButton } from "./ui/IconButton";
 import { WindowControls } from "./ui/WindowControls";
 import * as ipc from "../lib/ipc";
@@ -20,13 +20,17 @@ function BrandMark() {
   );
 }
 
+function actionTooltip(id: string, fallback: string): string {
+  const a = getAction(id);
+  if (!a) return fallback;
+  return a.shortcut ? `${a.label} (${a.shortcut})` : a.label;
+}
+
 export function TopBar({ onExport }: { onExport: () => void }) {
   const project = useEditorStore((s) => s.project);
   const canUndo = useEditorStore((s) => s.canUndo);
   const canRedo = useEditorStore((s) => s.canRedo);
-  const undo = useEditorStore((s) => s.undo);
-  const redo = useEditorStore((s) => s.redo);
-  const saveProject = useEditorStore((s) => s.saveProject);
+  const saveStatus = useEditorStore((s) => s.saveStatus);
 
   const hasProject = !!project;
 
@@ -43,22 +47,29 @@ export function TopBar({ onExport }: { onExport: () => void }) {
 
       <div className="topbar-group">
         <IconButton
+          icon={House}
+          iconOnly
+          tooltip={actionTooltip("project.close", "All projects")}
+          disabled={!hasProject}
+          onClick={() => invokeAction("project.close")}
+        />
+        <IconButton
           icon={FilePlus}
           iconOnly
-          tooltip="New project (Ctrl+N)"
-          onClick={() => void createNewProjectFlow()}
+          tooltip={actionTooltip("project.new", "New project")}
+          onClick={() => invokeAction("project.new")}
         />
         <IconButton
           icon={FolderOpen}
           iconOnly
-          tooltip="Open project"
-          onClick={() => void openExistingProjectFlow()}
+          tooltip={actionTooltip("project.open", "Open project")}
+          onClick={() => invokeAction("project.open")}
         />
         <IconButton
           icon={Save}
           iconOnly
-          tooltip="Save (Ctrl+S)"
-          onClick={() => void saveProject()}
+          tooltip={actionTooltip("project.save", "Save")}
+          onClick={() => invokeAction("project.save")}
         />
       </div>
 
@@ -66,16 +77,16 @@ export function TopBar({ onExport }: { onExport: () => void }) {
         <IconButton
           icon={Undo2}
           iconOnly
-          tooltip="Undo (Ctrl+Z)"
+          tooltip={actionTooltip("edit.undo", "Undo")}
           disabled={!canUndo}
-          onClick={() => void undo()}
+          onClick={() => invokeAction("edit.undo")}
         />
         <IconButton
           icon={Redo2}
           iconOnly
-          tooltip="Redo (Ctrl+Y)"
+          tooltip={actionTooltip("edit.redo", "Redo")}
           disabled={!canRedo}
-          onClick={() => void redo()}
+          onClick={() => invokeAction("edit.redo")}
         />
       </div>
 
@@ -84,15 +95,20 @@ export function TopBar({ onExport }: { onExport: () => void }) {
       <div className={`project-chip${hasProject ? " live" : ""}`} data-tauri-drag-region>
         <span className="dot" />
         <span className="label">{project ? project.name : "No project"}</span>
+        {hasProject && saveStatus === "saved" ? (
+          <span className="save-status">Saved</span>
+        ) : hasProject && saveStatus === "saving" ? (
+          <span className="save-status">Saving…</span>
+        ) : null}
       </div>
 
       <IconButton
         icon={Download}
         label="Export"
         variant="primary"
-        tooltip="Export video"
+        tooltip={actionTooltip("project.export", "Export video")}
         disabled={!hasProject}
-        onClick={onExport}
+        onClick={() => invokeAction("project.export", { openExport: onExport })}
       />
 
       <WindowControls />

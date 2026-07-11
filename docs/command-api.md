@@ -61,6 +61,13 @@ application" below. This is a GUI/Tauri-layer convenience over the same `apply_c
 per-command logic, not a second core API; CLI/MCP callers just call `apply_command`
 per command as before.
 
+**App IPC shape (not core).** In `renderly-app`, the Tauri (and bridge) `apply_command` /
+`apply_commands` / `undo` / `redo` handlers return `{ revision, patch, … }` where `patch`
+is an RFC-6902 JSON Patch (`json-patch` crate `diff` of pre/post `Project` JSON). This is
+session-layer transport so the webview can apply deltas without a full `get_project` each
+edit — it does **not** change the core `Command` enum or `apply_command` signature above.
+See [architecture.md](architecture.md) "Tauri command surface".
+
 `CommandOutcome` carries whatever the caller needs back (e.g. `ImportMedia` returns the new
 `media_id`; edit commands return `Ok(CommandOutcome::Applied)`; `GenerateVoiceover` returns
 `media_id` and `clip_id`; `Export` drives the render pipeline).

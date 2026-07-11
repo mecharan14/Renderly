@@ -83,4 +83,16 @@ impl PreviewPanel {
     ) -> Result<(), PreviewError> {
         self.inner.present_rgba(pixels, width, height)
     }
+
+    /// A4: shared preview GPU device for `FrameRenderer::with_device`.
+    pub fn shared_device(
+        &self,
+    ) -> Option<(std::sync::Arc<wgpu::Device>, std::sync::Arc<wgpu::Queue>)> {
+        self.inner.shared_device()
+    }
+
+    /// A4: blit a same-device composited texture view (no CPU round-trip).
+    pub fn present_texture_view(&mut self, source: &wgpu::TextureView) -> Result<(), PreviewError> {
+        self.inner.present_texture_view(source)
+    }
 }

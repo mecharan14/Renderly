@@ -46,6 +46,16 @@ pub struct Transcript {
     pub segments: Vec<TranscriptSegment>,
 }
 
+/// Encode an RGBA8 buffer as PNG bytes (shared by headless perceive and live app preview).
+pub fn encode_rgba_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, PerceiveError> {
+    let mut png = Vec::new();
+    let encoder = image::codecs::png::PngEncoder::new(&mut png);
+    encoder
+        .write_image(rgba, width, height, image::ExtendedColorType::Rgba8)
+        .map_err(|e| PerceiveError::PngEncode(e.to_string()))?;
+    Ok(png)
+}
+
 /// Render the composited timeline frame at `time_secs` as PNG bytes.
 pub fn render_frame_png(
     project: &Project,
@@ -54,17 +64,7 @@ pub fn render_frame_png(
 ) -> Result<Vec<u8>, PerceiveError> {
     let settings = ExportSettings::from_preset(&preset, project);
     let rgba = render_frame_at(project, time_secs, settings)?;
-    let mut png = Vec::new();
-    let encoder = image::codecs::png::PngEncoder::new(&mut png);
-    encoder
-        .write_image(
-            &rgba,
-            settings.width,
-            settings.height,
-            image::ExtendedColorType::Rgba8,
-        )
-        .map_err(|e| PerceiveError::PngEncode(e.to_string()))?;
-    Ok(png)
+    encode_rgba_png(&rgba, settings.width, settings.height)
 }
 
 /// Transcribe a media item with whisper.cpp CLI (local STT).

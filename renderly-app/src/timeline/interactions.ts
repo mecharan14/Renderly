@@ -11,9 +11,9 @@ import {
   RULER_H,
   TRACK_LABEL_W,
   secsFromCanvasX,
-  snapTime,
   trackIndexAtY,
 } from "./layout";
+import { snapTime } from "./snap";
 
 type DragState =
   | {
@@ -34,6 +34,8 @@ type DragState =
       clipId: string;
       startX: number;
       origPos: number;
+      /** When length > 1, group-move: same delta on each (no cross-track). */
+      group: { trackId: string; clipId: string; origPos: number }[] | null;
     }
   | {
       mode: "trim-left";
@@ -183,9 +185,11 @@ export function useTimelineInteractions(canvasRef: RefObject<HTMLCanvasElement |
       if (hit) {
         const hitTrack = project.tracks.find((t) => t.id === hit.trackId);
         const locked = hitTrack?.locked ?? false;
+        const hitSel = { trackId: hit.trackId, clipId: hit.clip.id };
 
         if (locked) {
-          store.select({ trackId: hit.trackId, clipId: hit.clip.id });
+          if (ev.shiftKey) store.toggleSelect(hitSel);
+          else store.select(hitSel);
           store.toast("Track is locked — unlock it to edit with the mouse", "info");
           return;
         }
@@ -202,7 +206,19 @@ export function useTimelineInteractions(canvasRef: RefObject<HTMLCanvasElement |
           return;
         }
 
-        store.select({ trackId: hit.trackId, clipId: hit.clip.id });
+        // C3: Shift+click toggles multi-select (no drag).
+        if (ev.shiftKey && store.toolMode === "select") {
+          store.toggleSelect(hitSel);
+          return;
+        }
+
+        const inMulti =
+          store.selections.length > 1 &&
+          store.selections.some((s) => s.trackId === hitSel.trackId && s.clipId === hitSel.clipId);
+        if (!inMulti) {
+          store.select(hitSel);
+        }
+
         if (store.toolMode === "select" && hit.edge === "left" && hit.clip.type === "caption") {
           dragStateRef.current = {
             mode: "trim-left-caption",
@@ -231,6 +247,16 @@ export function useTimelineInteractions(canvasRef: RefObject<HTMLCanvasElement |
             origOut: hit.clip.type === "caption" ? hit.clip.duration_secs : hit.clip.source_out_secs,
           };
         } else if (store.toolMode === "select") {
+          const fresh = useEditorStore.getState();
+          let group: { trackId: string; clipId: string; origPos: number }[] | null = null;
+          if (fresh.selections.length > 1) {
+            group = [];
+            for (const s of fresh.selections) {
+              const c = findClip(project, s.trackId, s.clipId);
+              if (c) group.push({ trackId: s.trackId, clipId: s.clipId, origPos: c.position_secs });
+            }
+            if (group.length < 2) group = null;
+          }
           dragStateRef.current = {
             mode: "move",
             origTrackId: hit.trackId,
@@ -238,6 +264,7 @@ export function useTimelineInteractions(canvasRef: RefObject<HTMLCanvasElement |
             clipId: hit.clip.id,
             startX: x,
             origPos: hit.clip.position_secs,
+            group,
           };
         }
         if (dragStateRef.current) store.setDragging(true);
@@ -322,25 +349,42 @@ export function useTimelineInteractions(canvasRef: RefObject<HTMLCanvasElement |
           clip.id,
         );
         store.setSnapGuide(Math.abs(pos - rawPos) > 1e-6 ? pos : null);
+        const appliedDelta = pos - drag.origPos;
 
-        const destIndex = trackIndexAtY(rect.height, project.tracks.length, y, store.scrollY);
-        const destTrack = project.tracks[destIndex];
-        const srcTrack = project.tracks.find((t) => t.id === drag.currentTrackId);
-        const canCrossMove =
-          destTrack &&
-          srcTrack &&
-          destTrack.id !== srcTrack.id &&
-          destTrack.kind === srcTrack.kind &&
-          !destTrack.locked;
-
-        if (canCrossMove) {
-          nextProject = moveClipAcrossTracks(project, drag.currentTrackId, destTrack.id, clip.id, pos);
-          dragStateRef.current = { ...drag, currentTrackId: destTrack.id };
+        // C3 group move: same delta for every selected clip; no cross-track.
+        if (drag.group && drag.group.length > 1) {
+          // Clamp so none go negative.
+          let minOrig = Infinity;
+          for (const g of drag.group) minOrig = Math.min(minOrig, g.origPos);
+          const clampedDelta = appliedDelta < -minOrig ? -minOrig : appliedDelta;
+          let next = project;
+          for (const g of drag.group) {
+            next = withClip(next, g.trackId, g.clipId, (c) => ({
+              ...c,
+              position_secs: Math.max(0, g.origPos + clampedDelta),
+            }));
+          }
+          nextProject = next;
         } else {
-          nextProject = withClip(project, drag.currentTrackId, clip.id, (c) => ({
-            ...c,
-            position_secs: pos,
-          }));
+          const destIndex = trackIndexAtY(rect.height, project.tracks.length, y, store.scrollY);
+          const destTrack = project.tracks[destIndex];
+          const srcTrack = project.tracks.find((t) => t.id === drag.currentTrackId);
+          const canCrossMove =
+            destTrack &&
+            srcTrack &&
+            destTrack.id !== srcTrack.id &&
+            destTrack.kind === srcTrack.kind &&
+            !destTrack.locked;
+
+          if (canCrossMove) {
+            nextProject = moveClipAcrossTracks(project, drag.currentTrackId, destTrack.id, clip.id, pos);
+            dragStateRef.current = { ...drag, currentTrackId: destTrack.id };
+          } else {
+            nextProject = withClip(project, drag.currentTrackId, clip.id, (c) => ({
+              ...c,
+              position_secs: pos,
+            }));
+          }
         }
 
         // Edge auto-scroll while dragging clips.
@@ -462,6 +506,21 @@ export function useTimelineInteractions(canvasRef: RefObject<HTMLCanvasElement |
       }
 
       if (drag.mode === "move") {
+        // C3: group commit — same delta for all selected clips (all-or-nothing batch).
+        if (drag.group && drag.group.length > 1) {
+          const primary = findClip(project, drag.currentTrackId, drag.clipId);
+          if (!primary) return;
+          const appliedDelta = primary.position_secs - drag.origPos;
+          let minOrig = Infinity;
+          for (const g of drag.group) minOrig = Math.min(minOrig, g.origPos);
+          const clampedDelta = appliedDelta < -minOrig ? -minOrig : appliedDelta;
+          const commands = drag.group.map((g) =>
+            moveClip(g.trackId, g.clipId, Math.max(0, g.origPos + clampedDelta)),
+          );
+          void store.dispatchBatch(commands);
+          return;
+        }
+
         const clip = findClip(project, drag.currentTrackId, drag.clipId);
         if (!clip) return;
         const pos = snapTime(
@@ -535,12 +594,16 @@ export async function splitSelectedAtPlayhead(): Promise<void> {
 
 export async function deleteSelected(ripple: boolean): Promise<void> {
   const store = useEditorStore.getState();
-  if (!store.selection) return;
-  const track = store.project?.tracks.find((t) => t.id === store.selection!.trackId);
-  if (track?.locked) {
-    store.toast("Track is locked — unlock it to edit", "info");
-    return;
+  if (store.selections.length === 0) return;
+  for (const sel of store.selections) {
+    const track = store.project?.tracks.find((t) => t.id === sel.trackId);
+    if (track?.locked) {
+      store.toast("Track is locked — unlock it to edit", "info");
+      return;
+    }
   }
-  await store.dispatch(deleteClip(store.selection.trackId, store.selection.clipId, ripple));
+  const commands = store.selections.map((sel) => deleteClip(sel.trackId, sel.clipId, ripple));
+  if (commands.length === 1) await store.dispatch(commands[0]!);
+  else await store.dispatchBatch(commands);
   store.select(null);
 }

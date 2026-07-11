@@ -267,6 +267,21 @@ impl Preview {
         }
         Ok(())
     }
+
+    pub fn shared_device(
+        &self,
+    ) -> Option<(std::sync::Arc<wgpu::Device>, std::sync::Arc<wgpu::Queue>)> {
+        self.gfx.as_ref().map(|g| g.shared_device())
+    }
+
+    pub fn present_texture_view(&mut self, source: &wgpu::TextureView) -> Result<(), PreviewError> {
+        let gfx = self.gfx.as_mut().ok_or(PreviewError::NotInitialized)?;
+        gfx.present_texture_view(source)?;
+        if let Some(conn) = &self.conn {
+            let _ = conn.flush();
+        }
+        Ok(())
+    }
 }
 
 fn preview_gfx_state(

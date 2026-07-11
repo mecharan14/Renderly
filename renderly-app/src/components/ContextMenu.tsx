@@ -1,15 +1,13 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useEditorStore } from "../store/editorStore";
 import { setClipEnabled, splitClip } from "../lib/commands";
+import { invokeAction } from "../lib/actions";
 
 export function ContextMenu() {
   const menu = useEditorStore((s) => s.contextMenu);
   const project = useEditorStore((s) => s.project);
   const dispatch = useEditorStore((s) => s.dispatch);
   const closeContextMenu = useEditorStore((s) => s.closeContextMenu);
-  const copySelection = useEditorStore((s) => s.copySelection);
-  const pasteAtPlayhead = useEditorStore((s) => s.pasteAtPlayhead);
-  const duplicateSelection = useEditorStore((s) => s.duplicateSelection);
   const clipboard = useEditorStore((s) => s.clipboard);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
@@ -71,13 +69,17 @@ export function ContextMenu() {
       >
         Split at click
       </button>
-      <button type="button" disabled={locked} onClick={() => run(() => void duplicateSelection())}>
+      <button type="button" disabled={locked} onClick={() => run(() => invokeAction("edit.duplicate"))}>
         Duplicate
       </button>
-      <button type="button" onClick={() => run(copySelection)}>
+      <button type="button" onClick={() => run(() => invokeAction("edit.copy"))}>
         Copy
       </button>
-      <button type="button" disabled={locked || !clipboard} onClick={() => run(() => void pasteAtPlayhead())}>
+      <button
+        type="button"
+        disabled={locked || !clipboard}
+        onClick={() => run(() => invokeAction("edit.paste"))}
+      >
         Paste
       </button>
       {isMedia && clip && (
@@ -96,6 +98,7 @@ export function ContextMenu() {
         disabled={locked}
         onClick={() =>
           run(async () => {
+            // Context menu deletes the right-clicked clip (may differ from store selection).
             await useEditorStore.getState().dispatch({
               command: "DeleteClip",
               track_id: menu.trackId,

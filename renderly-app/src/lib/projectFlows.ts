@@ -49,14 +49,15 @@ export async function quickStartWithImport(): Promise<void> {
 }
 
 export async function createNewProjectFlow(): Promise<void> {
+  // G2: CapCut-style — auto-create in the default projects dir, no save dialog.
   const store = useEditorStore.getState();
-  const path = await ipc.pickProjectSavePath();
-  if (!path) return;
-  await store.createNewProject(path, "Untitled edit");
-  store.toast("New project created", "success");
-  const mediaPath = await ipc.pickMediaFile();
-  if (mediaPath) await store.importMediaSmart(mediaPath);
-  else store.toast("Import media when you're ready", "info");
+  try {
+    const ready = await store.quickStart();
+    if (!ready) return;
+    store.toast("New project created", "success");
+  } catch (e) {
+    store.toast(`New project failed: ${e instanceof Error ? e.message : String(e)}`, "error");
+  }
 }
 
 export async function openExistingProjectFlow(): Promise<void> {
