@@ -4,9 +4,39 @@
 
 import type { Project } from "../lib/types";
 
+// P2: the Rust project schema types every id as a UUID, and the wasm compositor's
+// set_project parses the store project with serde — so the sample project's ids must be
+// REAL UUID strings, not the readable slugs P1 used. MOCK_IDS keeps the old readable
+// names addressable for harness scripts (window-side tests import nothing; use e.g.
+// `__store.getState().project.tracks.find(...)` or copy the literals below).
+export const MOCK_IDS = {
+  "mock-project": "00000000-0000-4000-8000-000000000000",
+  "m-round1": "aaaaaaaa-0000-4000-8000-000000000001",
+  "m-killcam": "aaaaaaaa-0000-4000-8000-000000000002",
+  "m-round2": "aaaaaaaa-0000-4000-8000-000000000003",
+  "m-facecam": "aaaaaaaa-0000-4000-8000-000000000004",
+  "m-vo": "aaaaaaaa-0000-4000-8000-000000000005",
+  "m-bgm": "aaaaaaaa-0000-4000-8000-000000000006",
+  "m-logo": "aaaaaaaa-0000-4000-8000-000000000007",
+  "t-v2": "bbbbbbbb-0000-4000-8000-000000000001",
+  "t-v1": "bbbbbbbb-0000-4000-8000-000000000002",
+  "t-a1": "bbbbbbbb-0000-4000-8000-000000000003",
+  "t-c1": "bbbbbbbb-0000-4000-8000-000000000004",
+  "c-facecam": "cccccccc-0000-4000-8000-000000000001",
+  "c-round1": "cccccccc-0000-4000-8000-000000000002",
+  "c-killcam": "cccccccc-0000-4000-8000-000000000003",
+  "c-round2": "cccccccc-0000-4000-8000-000000000004",
+  "c-vo": "cccccccc-0000-4000-8000-000000000005",
+  "c-bgm": "cccccccc-0000-4000-8000-000000000006",
+  "c-cap1": "cccccccc-0000-4000-8000-000000000007",
+  "c-cap2": "cccccccc-0000-4000-8000-000000000008",
+  "c-cap3": "cccccccc-0000-4000-8000-000000000009",
+  "e1": "eeeeeeee-0000-4000-8000-000000000001",
+} as const;
+
 const sampleProject: Project = {
   schema_version: 6,
-  id: "mock-project",
+  id: MOCK_IDS["mock-project"],
   name: "Ultra Bruno ep.12",
   settings: { fps: 60, width: 1080, height: 1920, sample_rate: 48000, duck_db: -12 },
   // NOTE: paths here are only ever resolved through `convertFileSrc` below (the harness
@@ -15,42 +45,42 @@ const sampleProject: Project = {
   // (1920x1080@60, 12s) so timeline eval (source_in/out) lines up with what actually
   // decodes. See docs/preview-webview.md "Harness verification".
   media: [
-    { id: "m-round1", path: "C:/clips/round1.mp4", kind: "video", duration_secs: 12, width: 1920, height: 1080, fps: 60 },
-    { id: "m-killcam", path: "C:/clips/kill-cam.mp4", kind: "video", duration_secs: 12, width: 1920, height: 1080, fps: 60 },
-    { id: "m-round2", path: "C:/clips/round2.mp4", kind: "video", duration_secs: 12, width: 1920, height: 1080, fps: 60 },
-    { id: "m-facecam", path: "C:/clips/facecam.mp4", kind: "video", duration_secs: 12, width: 1920, height: 1080, fps: 60 },
-    { id: "m-vo", path: "C:/audio/vo-take2.wav", kind: "audio", duration_secs: 65, width: null, height: null, fps: null },
-    { id: "m-bgm", path: "C:/audio/bgm-loop.mp3", kind: "audio", duration_secs: 90, width: null, height: null, fps: null },
-    { id: "m-logo", path: "C:/img/logo.png", kind: "image", duration_secs: null, width: 512, height: 512, fps: null },
+    { id: MOCK_IDS["m-round1"], path: "C:/clips/round1.mp4", kind: "video", duration_secs: 12, width: 1920, height: 1080, fps: 60 },
+    { id: MOCK_IDS["m-killcam"], path: "C:/clips/kill-cam.mp4", kind: "video", duration_secs: 12, width: 1920, height: 1080, fps: 60 },
+    { id: MOCK_IDS["m-round2"], path: "C:/clips/round2.mp4", kind: "video", duration_secs: 12, width: 1920, height: 1080, fps: 60 },
+    { id: MOCK_IDS["m-facecam"], path: "C:/clips/facecam.mp4", kind: "video", duration_secs: 12, width: 1920, height: 1080, fps: 60 },
+    { id: MOCK_IDS["m-vo"], path: "C:/audio/vo-take2.wav", kind: "audio", duration_secs: 65, width: null, height: null, fps: null },
+    { id: MOCK_IDS["m-bgm"], path: "C:/audio/bgm-loop.mp3", kind: "audio", duration_secs: 90, width: null, height: null, fps: null },
+    { id: MOCK_IDS["m-logo"], path: "C:/img/logo.png", kind: "image", duration_secs: null, width: 512, height: 512, fps: null },
   ],
   tracks: [
     {
-      id: "t-v2", kind: "video", name: "Overlay", muted: false, locked: false, hidden: false,
+      id: MOCK_IDS["t-v2"], kind: "video", name: "Overlay", muted: false, locked: false, hidden: false,
       clips: [
-        { type: "video", id: "c-facecam", media_id: "m-facecam", position_secs: 10, source_in_secs: 0, source_out_secs: 6.2, gain_db: 0, enabled: true, fade_in_secs: 0, fade_out_secs: 0, transform: { x: 0, y: -0.55, scale_x: 0.32, scale_y: 0.32, rotation_deg: 0, opacity: 1 } },
+        { type: "video", id: MOCK_IDS["c-facecam"], media_id: MOCK_IDS["m-facecam"], position_secs: 10, source_in_secs: 0, source_out_secs: 6.2, gain_db: 0, enabled: true, fade_in_secs: 0, fade_out_secs: 0, transform: { x: 0, y: -0.55, scale_x: 0.32, scale_y: 0.32, rotation_deg: 0, opacity: 1 } },
       ],
     },
     {
-      id: "t-v1", kind: "video", name: "Gameplay", muted: false, locked: false, hidden: false,
+      id: MOCK_IDS["t-v1"], kind: "video", name: "Gameplay", muted: false, locked: false, hidden: false,
       clips: [
-        { type: "video", id: "c-round1", media_id: "m-round1", position_secs: 0, source_in_secs: 0, source_out_secs: 9.4, gain_db: 0, enabled: true, fade_in_secs: 0, fade_out_secs: 0, outgoing_transition: { kind: "crossfade", duration_secs: 0.5 } },
-        { type: "video", id: "c-killcam", media_id: "m-killcam", position_secs: 9.4, source_in_secs: 2, source_out_secs: 10.3, gain_db: -3, enabled: true, fade_in_secs: 0, fade_out_secs: 0, transform: { x: 0, y: 0, scale_x: 1, scale_y: 1, rotation_deg: 0, opacity: 1 }, effects: [{ id: "e1", effect_id: "builtin:color_adjust", enabled: true, params: { contrast: 1.1 } }] },
-        { type: "video", id: "c-round2", media_id: "m-round2", position_secs: 18, source_in_secs: 0, source_out_secs: 11.1, gain_db: 0, enabled: true, fade_in_secs: 0, fade_out_secs: 0 },
+        { type: "video", id: MOCK_IDS["c-round1"], media_id: MOCK_IDS["m-round1"], position_secs: 0, source_in_secs: 0, source_out_secs: 9.4, gain_db: 0, enabled: true, fade_in_secs: 0, fade_out_secs: 0, outgoing_transition: { kind: "crossfade", duration_secs: 0.5 } },
+        { type: "video", id: MOCK_IDS["c-killcam"], media_id: MOCK_IDS["m-killcam"], position_secs: 9.4, source_in_secs: 2, source_out_secs: 10.3, gain_db: -3, enabled: true, fade_in_secs: 0, fade_out_secs: 0, transform: { x: 0, y: 0, scale_x: 1, scale_y: 1, rotation_deg: 0, opacity: 1 }, effects: [{ id: MOCK_IDS["e1"], effect_id: "builtin:color_adjust", enabled: true, params: { contrast: 1.1 } }] },
+        { type: "video", id: MOCK_IDS["c-round2"], media_id: MOCK_IDS["m-round2"], position_secs: 18, source_in_secs: 0, source_out_secs: 11.1, gain_db: 0, enabled: true, fade_in_secs: 0, fade_out_secs: 0 },
       ],
     },
     {
-      id: "t-a1", kind: "audio", name: "Voiceover", audio_role: "voiceover", muted: false, locked: false, hidden: false,
+      id: MOCK_IDS["t-a1"], kind: "audio", name: "Voiceover", audio_role: "voiceover", muted: false, locked: false, hidden: false,
       clips: [
-        { type: "audio", id: "c-vo", media_id: "m-vo", position_secs: 2.5, source_in_secs: 0, source_out_secs: 18, gain_db: 0, enabled: true, fade_in_secs: 0.2, fade_out_secs: 0.4 },
-        { type: "audio", id: "c-bgm", media_id: "m-bgm", position_secs: 22, source_in_secs: 0, source_out_secs: 12, gain_db: -12, enabled: true, fade_in_secs: 0, fade_out_secs: 1 },
+        { type: "audio", id: MOCK_IDS["c-vo"], media_id: MOCK_IDS["m-vo"], position_secs: 2.5, source_in_secs: 0, source_out_secs: 18, gain_db: 0, enabled: true, fade_in_secs: 0.2, fade_out_secs: 0.4 },
+        { type: "audio", id: MOCK_IDS["c-bgm"], media_id: MOCK_IDS["m-bgm"], position_secs: 22, source_in_secs: 0, source_out_secs: 12, gain_db: -12, enabled: true, fade_in_secs: 0, fade_out_secs: 1 },
       ],
     },
     {
-      id: "t-c1", kind: "caption", name: "Captions", muted: false, locked: false, hidden: false,
+      id: MOCK_IDS["t-c1"], kind: "caption", name: "Captions", muted: false, locked: false, hidden: false,
       clips: [
-        { type: "caption", id: "c-cap1", text: "okay so THIS run", position_secs: 3, duration_secs: 2.4, style_id: "tiktok-bold-yellow" },
-        { type: "caption", id: "c-cap2", text: "was absolutely cursed", position_secs: 6, duration_secs: 3, style_id: "tiktok-bold-yellow" },
-        { type: "caption", id: "c-cap3", text: "watch the corner", position_secs: 11, duration_secs: 2.2, style_id: "tiktok-bold-yellow" },
+        { type: "caption", id: MOCK_IDS["c-cap1"], text: "okay so THIS run", position_secs: 3, duration_secs: 2.4, style_id: "tiktok-bold-yellow" },
+        { type: "caption", id: MOCK_IDS["c-cap2"], text: "was absolutely cursed", position_secs: 6, duration_secs: 3, style_id: "tiktok-bold-yellow" },
+        { type: "caption", id: MOCK_IDS["c-cap3"], text: "watch the corner", position_secs: 11, duration_secs: 2.2, style_id: "tiktok-bold-yellow" },
       ],
     },
   ],

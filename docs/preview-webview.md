@@ -170,130 +170,174 @@ media file ──► <video> / WebCodecs VideoDecoder (HW decode, browser-schedu
   effect); the native fallback remains the way to preview those until P2 lands. Audio
   stays entirely on the existing backend/rodio path (`playback:tick` is audio-clock-driven
   regardless of preview mode) — unaffected by this migration.
-- **P2 — WASM compositor. IN PROGRESS — stopped after stage 2 of 5 (core compiles on
-  wasm32; eval extraction + native tests green). `renderly-wasm` crate, actual WebGPU
-  rendering, and harness verification are NOT done yet** — see below.
+- **P2 — WASM compositor. IMPLEMENTED 2026-07-15** (stages 1–5 of the migration plan; the
+  P2 target — renderly-core's actual compositor compiled to wasm32/WebGPU rendering the
+  editor preview — is live, with the deferred items listed below). Committed baseline for
+  stages 1–2 (wasm32 gating + eval extraction) is b910c52; this entry documents the full
+  P2 state including stages 3–5.
 
-  **What was built (stage 1 — wasm32 gating):**
-  - `renderly-core/Cargo.toml`: native-only deps (`ab_glyph`, `image`, `pollster`,
-    `reqwest`, `wasmtime`, `wat`) moved under
-    `[target.'cfg(not(target_arch = "wasm32"))'.dependencies]`; added
-    `[target.'cfg(target_arch = "wasm32")'.dependencies]` for `getrandom/js` and
-    `uuid/js` (uuid's default RNG backend doesn't link on `wasm32-unknown-unknown`
-    without it) and `wasm-bindgen` (not yet used — reserved for `renderly-wasm`).
-    Used `#[cfg(target_arch = "wasm32")]` gates throughout rather than a Cargo feature
-    (allowed per the task's "your call") — simpler than threading a feature through
-    every dependent crate, and the gate can't accidentally be left off in a native build.
-  - `renderly-core/src/lib.rs`: `audio`, `captions`, `commands`, `export`, `media`,
-    `perceive`, `plugins`, `segmentation` are now `#[cfg(not(target_arch = "wasm32"))]`
-    module declarations — they touch processes (FFmpeg CLI), the filesystem beyond
-    project JSON, or `wasmtime`. `project`, `compose` (+ `compose::eval`, `compose::effects`),
-    `mask`, `packs`, and the new `frame` module compile on both targets.
-  - `renderly-core/src/frame.rs` (new): `RgbaFrame { width, height, pixels }` moved out of
-    `media::ffmpeg_cli` (which re-exports it via `pub use crate::frame::RgbaFrame` for
-    source compat) so `compose`/`mask`/`packs` can use the decode-free pixel-buffer type
-    without depending on the FFmpeg-backed `media` module. This is the only structural
-    move; everything else is additive `#[cfg]`.
-  - `renderly-core/src/mask.rs`: `apply_raster_matte` no longer takes `&image::GrayImage`
-    — rewritten to take raw `&[u8]` + width/height so it has zero `image` crate dependency
-    and compiles on wasm32. `ClipMaskKind::Raster`/`Generated` (file-path-backed mattes,
-    need `image::open`) are native-only branches (no-op on wasm32); `ClipMaskKind::Luma`
-    (raw in-memory pixels) works on both — this is the documented P2 minimum ("rect/ellipse
-    masks" + Luma mattes; JS can decode a raster matte to Luma bytes if needed later).
-    `generate_heuristic_matte` (used by `segmentation`, needs `image::GrayImage`) is
-    native-only.
-  - `renderly-core/src/compose/effects/mod.rs`: the two `image::open` call sites for
-    `ClipMaskKind::Raster`/`Generated` matte loading inside `EffectProcessor` are
-    `#[cfg(not(target_arch = "wasm32"))]`; the wasm32 arm returns a `ComposeError` for
-    those two kinds and still handles `Luma`. Builtin GPU effects (`color_adjust`, `blur`,
-    LUT effects, `glitch`, chroma key, mask compositing) are untouched — same WGSL, same
-    Rust code path on both targets.
-  - `renderly-core/src/packs/mod.rs`: `LoadedPack`/`CubeLut`/`find_cube_lut`/
-    `cube_lut_upload_bytes`/`parse_pack_lut_id` (pure, in-memory) compile on both targets
-    so `compose::Compositor::composite`/`compose_to_texture` (which thread `&[LoadedPack]`
-    through unconditionally — not worth forking that signature) still type-check on wasm32.
-    Everything that touches `std::fs` or `Project::asset_pack_paths` (`load_pack`,
-    `parse_cube`, `load_project_packs`, `known_effect_ids`, `apply_pack_effects[_cpu]`,
-    `pack_id_at`) is native-only — **pack LUTs are deferred on the wasm path** per the
-    task's explicit scope allowance; a wasm caller passes an empty `&[LoadedPack]` slice.
-  - `renderly-core/src/compose/mod.rs`: `Compositor::new` (the `pollster::block_on`
-    blocking constructor used by export/CLI/MCP) and the private async `new_async` it
-    wraps are native-only — `pollster` can't block on a wasm event loop and adapter/device
-    requests are async-only there. `Compositor::with_device` (the A4 shared-device
-    constructor) stays available on both targets; per the architecture doc this is the
-    entry point `renderly-wasm` should call once it has a browser-obtained
-    `wgpu::Device`/`Queue` (via `wgpu::Instance` + `request_adapter`/`request_device` on
-    the WebGPU backend, called from async JS/wasm-bindgen glue that doesn't exist yet).
+  **What was built (stages 1–2, commit b910c52):**
+  - `renderly-core` compiles on `wasm32-unknown-unknown` via `#[cfg(target_arch)]` gating
+    (not a Cargo feature — simpler and can't be left off): `audio`, `captions`,
+    `commands`, `export`, `media`, `perceive`, `plugins`, `segmentation` are native-only;
+    `project` (+`anim`), `compose` (all WGSL effects/transitions/chroma/masks), `mask`,
+    `packs`' pure LUT helpers, and the new `frame` module (`RgbaFrame`, moved out of
+    `media`) build on both targets. Native-only deps live under
+    `[target.'cfg(not(target_arch = "wasm32"))'.dependencies]`.
+  - The parity-critical evaluation ("which layers are active at time T, with what source
+    times, keyframed params, transition progress") was extracted verbatim from
+    `export/mod.rs` into decode-free `renderly-core/src/compose/eval.rs`
+    (`active_layers` / `ActiveLayer` / `active_captions` / `multicam_angle_active`,
+    error type `EvalError`), used by BOTH the native `FrameRenderer` and the wasm
+    compositor — one evaluation, two frontends. 7 unit tests cover clip coverage,
+    source-time math, transition-window pair emission, hidden tracks, captions.
 
-  **What was built (stage 2 — eval extraction):**
-  - `renderly-core/src/compose/eval.rs` (new): moved `active_layers`, `ActiveLayer`,
-    `active_captions`, `ActiveCaption`, and `multicam_angle_active` out of
-    `export/mod.rs` verbatim (only the error type changed — see below). This is the
-    parity-critical "which layers are active at time T, with what source times, keyframed
-    transform/opacity, and transition progress" evaluation, and it was already decode-free
-    (it only reads `Project` state and returns `path`/`source_time` descriptors — actual
-    FFmpeg decode happens in `export::FrameRenderer::render_inner` after calling this).
-    Added a local `EvalError { MediaNotFound(Uuid), NotVideo(Uuid) }` (no `FfmpegCliError`/
-    `ComposeError`/`CaptionError` coupling, so it compiles on wasm32); `export::ExportError`
-    gained `impl From<EvalError> for ExportError` so `export/mod.rs`'s three call sites
-    (`render_inner`, `prefetch_around`, and the one test that called `active_layers`
-    directly) needed only an `eval::` prefix and a `?`/assertion update, not new error
-    handling. 7 new unit tests in `compose::eval::tests` cover: empty project, a clip
-    covering/not covering a query time (and the `source_time_at` math), a missing-media
-    error, a hidden track being skipped, the two-layer transition-window emission
-    (outgoing + incoming with correct `progress`/`is_incoming`), and caption visibility
-    windowing. `compose::mod.rs` re-exports `eval::{active_layers, active_captions,
-    ActiveLayer, ActiveCaption, EvalError}` so `renderly-wasm` (once it exists) can call
-    `renderly_core::compose::eval::active_layers(&project, t)` directly — same function,
-    same code path as native export/preview, satisfying the "one compositor" /
-    "never re-derive which layers are active independently" non-negotiable.
+  **What was built (stage 3 — the wasm crate and pipeline):**
+  - `renderly-core/src/compose/mod.rs`: `ComposeLayer.frame: RgbaFrame` became
+    `ComposeLayer.source: LayerSource` with two variants — `Frame(RgbaFrame)` (native
+    decode path, pooled upload textures, unchanged behavior) and `Texture { texture,
+    width, height }` (externally-owned GPU texture, bound directly, never pooled). This is
+    the zero-readback hook: the browser fills the texture, core composites it with the
+    same effect/mask/transition passes. `eval::ActiveLayer` gained `media_id` so the
+    webview can key its element pool by media item.
+  - New workspace member `renderly-wasm/` (cdylib+rlib). ALL its real dependencies are
+    target-gated to wasm32, so it builds as an empty lib on native targets —
+    `cargo build/test/clippy --workspace` on the native target stays green with it as a
+    plain member (verified). wasm-bindgen surface (`src/compositor.rs`):
+    - `WasmCompositor.create(canvas)` (async): WebGPU-only wgpu instance
+      (`Backends::BROWSER_WEBGPU`), surface from `SurfaceTarget::Canvas`, adapter/device
+      request, `get_default_config` surface config (browser-preferred format, typically
+      `Bgra8Unorm` — the A4 "format parameter" turned out NOT to exist in core, whose
+      internal RT is hardcoded `Rgba8Unorm`, so presentation is a tiny blit pass in
+      renderly-wasm that samples core's `output_view()` into the surface; the pipeline's
+      target format performs the conversion). Also installs a `device.on_uncaptured_error`
+      → `console.error` hook — on the WebGPU backend a validation error silently discards
+      the whole submit (stale/black canvas, no exception), which is undebuggable
+      without it.
+    - `set_project(json)`: serde-parses the store's project JSON (same schema as the
+      project file), rebuilds the core `Compositor` via `Compositor::with_device` when the
+      output resolution changes.
+    - `render(time_secs, sources)`: `sources` is a JS object mapping media-id →
+      `HTMLVideoElement`/`HTMLImageElement`. Runs `compose::eval::active_layers`, copies
+      each active layer's element into a pooled per-media `Rgba8Unorm` texture with
+      `Queue::copy_external_image_to_texture` (zero CPU readback; dest usage
+      `COPY_DST | RENDER_ATTACHMENT | TEXTURE_BINDING` per WebGPU spec), builds
+      `ComposeLayer`s (transform/effects/mask/transition straight from eval), runs
+      `compose_to_texture`, blits to the canvas surface, presents via `queue.present`.
+      Not-ready elements are skipped for the frame (same policy as P1). Raster/`Generated`
+      mattes are dropped (deferred, below).
+    - `debug_layers(time_secs, sources)`: QA introspection used by the harness (layer
+      count, per-layer element resolution, transition progress).
+  - Build: `npm run build:wasm` in renderly-app runs
+    `wasm-pack build ../renderly-wasm --target web --release --out-dir
+    ../renderly-app/src/wasm-pkg --no-pack`. The generated pkg is **gitignored**
+    (wasm-pack emits its own `*` .gitignore) — run `build:wasm` once after checkout to get
+    the GPU preview path. **Binary size: 468 KB wasm (release + wasm-opt) + 61 KB JS glue.**
+  - Shader fix that P2 flushed out: `transition.wgsl`'s `sample_or_black` called
+    `textureSample` under varying-dependent control flow — native naga is lenient, but the
+    browser's WGSL compiler enforces the uniformity analysis strictly and rejected the
+    module, which (silently!) discarded every submit containing the transition pass.
+    Rewritten to sample-then-`select` (and the slide branches hoist both samples out of
+    the varying branch). Same shader on both targets; a new native GPU test
+    (`compose::tests::transition_pair_blends_mid_progress`) now covers the transition
+    blend path with a readback assert.
 
-  **Verification actually run** (native, on this machine — no browser/harness work done
-  this pass, see below):
-  - `cargo check --target wasm32-unknown-unknown -p renderly-core`: clean, zero warnings.
-  - `cargo build --workspace`, `cargo test --workspace` (97 renderly-core tests, up from
-    90 — the 7 new `compose::eval` tests — plus unchanged app/cli/mcp suites), `cargo
-    clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all --check`: all green.
+  **What was built (engine integration, `webviewPreviewEngine.ts` / `WebviewPreview.tsx`):**
+  - Graceful-degradation ladder in the new async `WebviewPreviewEngine.init()`:
+    `navigator.gpu` present → `requestAdapter()` non-null (probed BEFORE touching the
+    canvas — a canvas that ever had a webgpu context can never yield a 2d one; plus one
+    300 ms retry, adapter requests can transiently return null during page load) → lazy
+    dynamic import of `/src/wasm-pkg/renderly_wasm.js` (specifier deliberately opaque to
+    Vite's static analysis via `@vite-ignore`; see "build step" below) → `create(canvas)`
+    → mode `"webgpu"`. Any missing rung → the untouched P1 Canvas2D path, mode
+    `"canvas2d"`. `localStorage["renderly.previewEngine"]="native"` still bypasses the
+    engine entirely.
+  - `window.__previewStats` gained `mode: "webgpu" | "canvas2d" | "native"` (the engine
+    reports the first two; "native" means the engine isn't instantiated).
+  - The P1 element-management layer (pooled `<video>`/`<img>`, dual-mode clock,
+    playback:tick slew, pre-seek, seek-correction, pause bookkeeping) is shared by both
+    modes (`manageElements`). In webgpu mode it additionally manages transition-incoming
+    clips (`transitionIncomingLayers` mirrors eval.rs's window math for ELEMENT
+    MANAGEMENT only — which `<video>` to play/seek; compositing decisions stay in Rust).
+  - In webgpu mode the engine hands every pooled element to `render(t, sources)` per
+    frame and pushes `set_project(JSON.stringify(project))` on every project change (the
+    store holds the Rust project schema verbatim), so paused transform-handle drags
+    redraw live exactly as in P1 (store patch → subscription/effect → set_project + one
+    render).
+  - React StrictMode note: dev double-mount used to race two async inits on one canvas
+    (deadlock). Init is serialized module-wide (`enqueueInit`) and honors `disposed`
+    mid-flight, freeing an orphaned compositor so the successor engine can claim the
+    canvas.
+  - The harness/mock (`tauriMock.ts`) sample project now uses real UUID ids (`MOCK_IDS`
+    keeps the old readable names addressable) — the Rust schema types ids as UUIDs and
+    the wasm `set_project` serde-parses the store project, so P1's readable slug ids
+    stopped parsing.
 
-  **NOT done this pass (stages 3–5 of the task's work order) — explicitly deferred, not
-  faked:**
-  - No `renderly-wasm` crate exists yet (not added to the workspace `members` list). No
-    wasm-bindgen `WasmCompositor` type, no `wasm-pack` build, no npm `build:wasm` script,
-    no Vite integration.
-  - `webviewPreviewEngine.ts` / `WebviewPreview.tsx` are untouched — the P1 Canvas2D path
-    is still the only rendering path in the app; no `navigator.gpu` feature-detect, no
-    `mode: "webgpu"` in `window.__previewStats`, no fallback-selection logic added.
-  - Nothing renders on a GPU/WebGPU path yet — no video layer, no transform, no effect, no
-    transition, no mask, no chroma key. Everything the app currently shows is still the
-    P1 cover-fit+transform-only Canvas2D preview.
-  - No harness verification was performed (`navigator.gpu` presence in the automation
-    pane was not checked; no pixel sampling; no store-driven effect/transition/mask test).
-  - No native-side parity fixture/example rendering frames for eyeball/pixel-diff
-    comparison against a future wasm render was added.
-  - No wasm binary size measurement (nothing built yet to measure).
-  - `rustup target add wasm32-unknown-unknown` was run and the target is installed;
-    `wasm-pack` was not installed (not needed yet — no crate to build).
+  **Measured in the browser harness (2026-07-15, `npx vite --config
+  vite.harness.config.ts --port 5188`, driven via javascript_tool + `window.__store`;
+  WebGPU WAS available in the pane — NVIDIA adapter):**
+  - Mode ladder: `__previewStats.mode === "webgpu"`, fallback path exercised earlier in
+    the session (pre-fix UUID parse failure correctly warned and fell back to canvas2d
+    without a black preview).
+  - Base compositing: video content on canvas (testsrc2 center `[7,19,202]` at t=2,
+    smptebars `[0,164,0]` after the cut); repaints on scrub.
+  - Effects (store-patched, GPU): `color_adjust` exposure 2.0 → `[25,73,255]`; blur r24 →
+    `[117,118,138]`; `lut_contrast` → `[0,0,210]`; `lut_warm` → `[3,15,182]`; `glitch` →
+    RGB-split displacement; all revert bit-exact to base.
+  - Transitions mid-junction: crossfade window [8.9,9.4) sampled at p10/p50/p90 →
+    `[229,232,0]` / `[127,202,0]` / `[25,172,0]` between pure outgoing `[255,240,0]` and
+    pure incoming `[0,164,0]` — monotonic linear mix, exactly `mix(a,b,u)`. `wipe_left`
+    at p50: left samples incoming, right samples outgoing. (Other 8 kinds share the same
+    verified shader/uniform path; not individually pixel-sampled.)
+  - Masks: rect (0.25..0.75)² → outside black, inside untouched; ellipse ditto.
+  - Chroma key: greenest smptebars pixel `[0,164,0]` → keyed to transparent (black
+    background) with `key_g` 0.63/tol 0.25 → `[0,0,0]`, restored exactly.
+  - Keyframes (Rust `project::anim` eval, not JS): opacity ramp 1→0 over 8 s sampled at
+    t=2 → `[5,14,152]` = exactly 0.75 × base (202×0.75=151.5); static opacity 0.5 →
+    `[3,9,101]`; keyframed `pos_x` shifts content (left edge black, center shows shifted
+    pixels). These exact multiplier matches (±1 LSB rounding) are the strongest
+    parity evidence collected: same keyframe eval + same composite WGSL as export.
+  - Multi-layer: with the covering track hidden, the transformed overlay clip
+    (scale 0.32, y=-0.55) renders at its transformed position (content at screen-y≈0.75
+    band, black elsewhere) — matching core's NDC math and P1's mirror of it.
+  - Paused drag-patch: store-only project patch (no engine calls) with opacity 0.3 →
+    canvas pixel `[2,6,60]` = exactly 0.3 × base — the optimistic-drag redraw path works
+    in GPU mode.
+  - Perf: per-frame CPU-side cost (`drawMs`: eval + element bookkeeping + 1–2
+    `copyExternalImageToTexture` + compose/blit encode + submit) measured **0.4–1.2 ms**
+    during sustained playback — well inside a 16.7 ms/60 fps budget. The harness pane's
+    fps figure (~1 fps) is meaningless: the automation tab reports `document.hidden`
+    and had been hidden long enough for Chrome's *intensive* timer throttling (~1 Hz
+    timers); as with P1, foreground fps must be confirmed in the real app (P1's
+    equivalent number was confirmed by the project owner in the desktop app).
 
-  **Why stopped here:** the task's own instructions say to work the vertical slice in
-  order and "if you run low on budget, STOP at a completed stage, make everything green,
-  and report exactly where you stopped" rather than leave multiple stages half-finished.
-  Stage 3 (standing up `renderly-wasm`, wiring wasm-bindgen, requesting a WebGPU
-  device/adapter from JS, uploading one video layer via
-  `queue.copy_external_image_to_texture`, and getting *something* on a canvas in the
-  harness) is a substantially larger and more failure-prone chunk of work — real
-  browser/WebGPU iteration, not just `cargo check` — and deserves its own uninterrupted
-  pass rather than a rushed, unverified attempt bolted onto this one.
+  **Parity status:** the P2 target ("pixel-diff preview vs `render_frame` export readback
+  ≤ 1 ULP-ish on the effects test project") is NOT yet automated cross-target — a
+  browser-side canvas readback goes through the stretched surface blit and browser video
+  decode, so a credible automated diff needs synthetic flat-color fixtures fed through
+  both paths (future work). What exists instead: (a) both paths are literally the same
+  Rust/WGSL (`compose::eval` + `Compositor`) built for two targets; (b) the native GPU
+  transition test added this pass; (c) the exact-multiplier opacity/keyframe pixel checks
+  above.
 
-  **Next session should start at:** creating `renderly-wasm/` as a workspace member,
-  scaffolding the wasm-bindgen `WasmCompositor` per the architecture section above
-  (`new(canvas)`, `set_project(json)`, `render(time, sources)`), and getting a single
-  video layer with transform+opacity composited to a harness canvas before broadening to
-  multi-layer/keyframes/transitions/effects/chroma/masks.
-
-- *(Original P2 scope description, unchanged as the target:)* Feature-gate core, compile
-  `compose/` to wasm32/WebGPU, wire transforms/opacity/transitions/effects/masks/chroma/
-  LUTs. Success: pixel-diff preview vs `render_frame` export readback ≤ 1 ULP-ish
-  tolerance on the effects test project.
+  **Deferred on the wasm path (explicitly, per the P2 scope allowances):**
+  - Pack (`.cube`) LUTs — need filesystem loads; `render` passes an empty pack slice and
+    pack-LUT effect instances are skipped. (Wire-up path: JS fetches pack bytes and hands
+    them over; `packs`' pure `CubeLut` upload helpers already compile on wasm32.)
+  - Raster / `Generated` mattes (`image::open`) — masks of those kinds are dropped before
+    composite (`Luma` in-memory mattes DO work). Background removal likewise (needs CPU
+    frame access).
+  - Captions burn-in (P3 per the phase plan), audio (stays on the backend/rodio path).
+  - Images in the harness: the sample logo isn't mapped to a real file by the mock, so the
+    `HTMLImageElement` code path in `render` is written but not pixel-verified.
+  - Same-media transitions: both sides of a transition between two clips of the SAME
+    media item share one `<video>` element, so both sample the same frame during the
+    window (native opens a second decoder; a second pooled element is future work).
+  - Production (`vite build`) bundles do NOT include the wasm pkg (the dynamic import
+    specifier is invisible to the bundler on purpose, so builds stay green with the
+    gitignored pkg absent — verified both with and without the pkg on disk). Dev mode
+    (Tauri dev server, harness) gets the GPU path; release builds fall back to Canvas2D
+    until P3 makes the wasm path the shipped default and bundles the pkg properly.
 - **P3 — Audio + full switchover.** WebAudio mixing (or keep backend audio if simpler),
   captions burn-in via the same WGSL text path, remove `set_preview_bounds`/child-window
   sync from the hot path, default the flag on.

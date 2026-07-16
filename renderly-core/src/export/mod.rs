@@ -3,7 +3,7 @@
 use crate::captions::CaptionError;
 use crate::commands::ExportPreset;
 use crate::compose::eval::{self, EvalError};
-use crate::compose::{ComposeError, ComposeLayer, Compositor};
+use crate::compose::{ComposeError, ComposeLayer, Compositor, LayerSource};
 use crate::media::{
     mix_timeline_audio, mux_video_audio, AudioMixClip, DuckSettings, FfmpegCliError, ReaderOptions,
     RgbaFrame, VideoEncoder, VideoReader,
@@ -377,7 +377,7 @@ impl FrameRenderer {
                 };
 
                 compose_layers.push(ComposeLayer {
-                    frame,
+                    source: LayerSource::Frame(frame),
                     transform: layer.transform,
                     effects: layer.effects.clone(),
                     mask,
@@ -388,13 +388,13 @@ impl FrameRenderer {
 
         for cap in eval::active_captions(project, time_secs) {
             compose_layers.push(ComposeLayer {
-                frame: crate::captions::render_caption_for_project(
+                source: LayerSource::Frame(crate::captions::render_caption_for_project(
                     project,
                     &cap.text,
                     &cap.style_id,
                     self.settings.width,
                     self.settings.height,
-                )?,
+                )?),
                 transform: ClipTransform::default(),
                 effects: Vec::new(),
                 mask: None,

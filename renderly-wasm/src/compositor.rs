@@ -1,0 +1,504 @@
+//! The WebGPU-backed preview compositor bridge. See lib.rs for the module story.
+//!
+//! Data flow per frame (`render`):
+//! 1. `compose::eval::active_layers(project, t)` — the SAME Rust evaluation the native
+//!    export uses (keyframes, speed, transitions, multicam) — decides what to draw.
+//! 2. For each active layer, the corresponding browser element (from `sources`) is copied
+//!    into a pooled per-media GPU texture with `Queue::copy_external_image_to_texture`
+//!    (WebGPU-only zero-readback path; the browser hands the decoder output straight to
+//!    the GPU).
+//! 3. `Compositor::compose_to_texture` runs the standard effect/mask/transition/composite
+//!    passes (same WGSL as export) into the compositor's internal RT.
+//! 4. A tiny blit pass samples that RT onto the canvas surface (whose swapchain format —
+//!    typically `Bgra8Unorm` on the web — the render pipeline converts to implicitly).
+//!
+//! Deferred on this path (documented in docs/preview-webview.md P2): pack (`.cube`) LUTs
+//! (they need filesystem loads; `packs` is empty here so pack-LUT effect instances are
+//! skipped by the effect processor), raster/`Generated` mattes (`image::open` — masks of
+//! those kinds are dropped before composite), captions burn-in (P3), and background
+//! removal (needs CPU frame access).
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use renderly_core::compose::{eval, ComposeLayer, Compositor, LayerSource};
+use renderly_core::project::{ClipMaskKind, Project};
+use wasm_bindgen::prelude::*;
+use web_sys::{HtmlCanvasElement, HtmlImageElement, HtmlVideoElement};
+
+const BLIT_WGSL: &str = r#"
+struct VsOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) i: u32) -> VsOut {
+    // Fullscreen triangle. UV v is flipped (NDC +Y up, texture v down).
+    var positions = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>(3.0, -1.0),
+        vec2<f32>(-1.0, 3.0),
+    );
+    let p = positions[i];
+    var out: VsOut;
+    out.pos = vec4<f32>(p, 0.0, 1.0);
+    out.uv = vec2<f32>(p.x * 0.5 + 0.5, 1.0 - (p.y * 0.5 + 0.5));
+    return out;
+}
+
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(textureSample(src, samp, in.uv).rgb, 1.0);
+}
+"#;
+
+fn js_err(context: &str, detail: impl core::fmt::Display) -> JsValue {
+    JsValue::from_str(&format!("renderly-wasm: {context}: {detail}"))
+}
+
+struct MediaTexture {
+    texture: wgpu::Texture,
+    width: u32,
+    height: u32,
+}
+
+/// One preview compositor bound to one `<canvas>`. Constructed with
+/// `await WasmCompositor.create(canvas)` from JS.
+#[wasm_bindgen]
+pub struct WasmCompositor {
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+    surface: wgpu::Surface<'static>,
+    surface_config: wgpu::SurfaceConfiguration,
+    canvas: HtmlCanvasElement,
+    compositor: Option<Compositor>,
+    project: Option<Project>,
+    /// media-id → pooled GPU texture receiving `copy_external_image_to_texture` copies.
+    /// Recreated only when the source's pixel size changes.
+    media_textures: HashMap<String, MediaTexture>,
+    blit_pipeline: wgpu::RenderPipeline,
+    blit_layout: wgpu::BindGroupLayout,
+    blit_sampler: wgpu::Sampler,
+    /// Cached bind group sampling the compositor's output view; rebuilt when the
+    /// compositor is (project resolution change), not per frame.
+    blit_bind_group: Option<wgpu::BindGroup>,
+}
+
+#[wasm_bindgen]
+impl WasmCompositor {
+    /// Async constructor: requests a WebGPU adapter/device, creates a surface on `canvas`,
+    /// and builds the presentation pipeline. Rejects (JS exception / rejected Promise) when
+    /// WebGPU is unavailable — the JS caller treats that as "fall back to Canvas2D".
+    pub async fn create(canvas: HtmlCanvasElement) -> Result<WasmCompositor, JsValue> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::BROWSER_WEBGPU,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+
+        let surface = instance
+            .create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone()))
+            .map_err(|e| js_err("create_surface", e))?;
+
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+                apply_limit_buckets: false,
+            })
+            .await
+            .map_err(|e| js_err("request_adapter (WebGPU unavailable?)", e))?;
+
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("renderly-preview-wasm"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+                memory_hints: wgpu::MemoryHints::Performance,
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                trace: wgpu::Trace::Off,
+            })
+            .await
+            .map_err(|e| js_err("request_device", e))?;
+
+        // Surface uncaptured GPU validation errors to the JS console — on the WebGPU
+        // backend a validation failure silently discards the whole submit (the canvas just
+        // shows the previous frame), which is undebuggable without this.
+        device.on_uncaptured_error(Arc::new(|e: wgpu::Error| {
+            web_sys::console::error_1(&JsValue::from_str(&format!(
+                "renderly-wasm uncaptured GPU error: {e}"
+            )));
+        }));
+
+        let width = canvas.width().max(1);
+        let height = canvas.height().max(1);
+        let surface_config = surface
+            .get_default_config(&adapter, width, height)
+            .ok_or_else(|| js_err("surface config", "surface not supported by adapter"))?;
+        surface.configure(&device, &surface_config);
+
+        let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("preview-blit"),
+            source: wgpu::ShaderSource::Wgsl(BLIT_WGSL.into()),
+        });
+        let blit_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("preview-blit"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let blit_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("preview-blit"),
+            bind_group_layouts: &[Some(&blit_layout)],
+            immediate_size: 0,
+        });
+        let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("preview-blit"),
+            layout: Some(&blit_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &blit_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &blit_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_config.format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let blit_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("preview-blit"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        Ok(WasmCompositor {
+            device: Arc::new(device),
+            queue: Arc::new(queue),
+            surface,
+            surface_config,
+            canvas,
+            compositor: None,
+            project: None,
+            media_textures: HashMap::new(),
+            blit_pipeline,
+            blit_layout,
+            blit_sampler,
+            blit_bind_group: None,
+        })
+    }
+
+    /// Replace the project (serde JSON, same schema as the project file / the app store).
+    /// Rebuilds the core compositor when the output resolution changes.
+    pub fn set_project(&mut self, json: &str) -> Result<(), JsValue> {
+        let project: Project =
+            serde_json::from_str(json).map_err(|e| js_err("set_project parse", e))?;
+        let (w, h) = (project.settings.width, project.settings.height);
+        let needs_rebuild = match &self.compositor {
+            Some(c) => c.width() != w || c.height() != h,
+            None => true,
+        };
+        if needs_rebuild {
+            let compositor =
+                Compositor::with_device(Arc::clone(&self.device), Arc::clone(&self.queue), w, h)
+                    .map_err(|e| js_err("compositor build", e))?;
+            self.compositor = Some(compositor);
+            self.blit_bind_group = None;
+        }
+        self.project = Some(project);
+        Ok(())
+    }
+
+    /// Composite the frame at `time_secs` and present it to the canvas.
+    ///
+    /// `sources` is a plain JS object mapping media-id strings to the `HTMLVideoElement` /
+    /// `HTMLImageElement` that currently holds that media's pixels (the P1 engine's element
+    /// pool). Layers whose element is missing or not yet decodable are skipped for this
+    /// frame — same policy as the P1 Canvas2D path.
+    pub fn render(&mut self, time_secs: f64, sources: &js_sys::Object) -> Result<(), JsValue> {
+        let Some(project) = self.project.as_ref() else {
+            return Ok(());
+        };
+        if self.compositor.is_none() {
+            return Ok(());
+        }
+
+        let layers =
+            eval::active_layers(project, time_secs).map_err(|e| js_err("active_layers", e))?;
+
+        let mut compose_layers: Vec<ComposeLayer> = Vec::with_capacity(layers.len());
+        for layer in &layers {
+            let key = layer.media_id.to_string();
+            let element = js_sys::Reflect::get(sources, &JsValue::from_str(&key))
+                .unwrap_or(JsValue::UNDEFINED);
+            if element.is_undefined() || element.is_null() {
+                continue;
+            }
+
+            let (source, width, height) = if let Some(video) = element.dyn_ref::<HtmlVideoElement>()
+            {
+                // readyState >= 2 (HAVE_CURRENT_DATA): same gate as the Canvas2D path.
+                if video.ready_state() < 2 {
+                    continue;
+                }
+                let (w, h) = (video.video_width(), video.video_height());
+                if w == 0 || h == 0 {
+                    continue;
+                }
+                (
+                    wgpu::CopyExternalImageSourceInfo {
+                        source: wgpu::ExternalImageSource::HTMLVideoElement(video.clone()),
+                        origin: wgpu::Origin2d::ZERO,
+                        flip_y: false,
+                    },
+                    w,
+                    h,
+                )
+            } else if let Some(img) = element.dyn_ref::<HtmlImageElement>() {
+                if !img.complete() {
+                    continue;
+                }
+                let (w, h) = (img.natural_width(), img.natural_height());
+                if w == 0 || h == 0 {
+                    continue;
+                }
+                (
+                    wgpu::CopyExternalImageSourceInfo {
+                        source: wgpu::ExternalImageSource::HTMLImageElement(img.clone()),
+                        origin: wgpu::Origin2d::ZERO,
+                        flip_y: false,
+                    },
+                    w,
+                    h,
+                )
+            } else {
+                continue;
+            };
+
+            let texture = self.ensure_media_texture(&key, width, height);
+            self.queue.copy_external_image_to_texture(
+                &source,
+                wgpu::CopyExternalImageDestInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                    color_space: wgpu::PredefinedColorSpace::Srgb,
+                    premultiplied_alpha: false,
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+
+            // Raster / generated mattes need filesystem decode — deferred on wasm (see the
+            // module doc). Everything else (rect/ellipse shapes) passes straight through.
+            let mask = layer.mask.clone().filter(|m| {
+                !matches!(
+                    m.kind,
+                    ClipMaskKind::Raster { .. } | ClipMaskKind::Generated { .. }
+                )
+            });
+
+            compose_layers.push(ComposeLayer {
+                source: LayerSource::Texture {
+                    texture,
+                    width,
+                    height,
+                },
+                transform: layer.transform,
+                effects: layer.effects.clone(),
+                mask,
+                transition: layer.transition,
+            });
+        }
+
+        let compositor = self.compositor.as_mut().expect("checked above");
+        compositor
+            .compose_to_texture(&[], &compose_layers)
+            .map_err(|e| js_err("compose", e))?;
+
+        self.present()
+    }
+
+    /// Debug/QA introspection (harness only): what does the eval see at `time_secs`, and
+    /// which sources resolve? Returns a JSON-ish summary string.
+    pub fn debug_layers(&self, time_secs: f64, sources: &js_sys::Object) -> String {
+        let Some(project) = self.project.as_ref() else {
+            return "no project".into();
+        };
+        match eval::active_layers(project, time_secs) {
+            Err(e) => format!("eval error: {e}"),
+            Ok(layers) => {
+                let mut out = String::new();
+                for layer in &layers {
+                    let key = layer.media_id.to_string();
+                    let element = js_sys::Reflect::get(sources, &JsValue::from_str(&key))
+                        .unwrap_or(JsValue::UNDEFINED);
+                    let found = !element.is_undefined() && !element.is_null();
+                    let ready = element
+                        .dyn_ref::<HtmlVideoElement>()
+                        .map(|v| v.ready_state())
+                        .unwrap_or(99);
+                    out.push_str(&format!(
+                        "[media={} found={found} ready={ready} transition={:?} opacity={}] ",
+                        &key[key.len() - 4..],
+                        layer
+                            .transition
+                            .map(|t| (t.kind.as_str(), t.progress, t.is_incoming)),
+                        layer.transform.opacity,
+                    ));
+                }
+                format!("{} layers: {out}", layers.len())
+            }
+        }
+    }
+
+    fn present(&mut self) -> Result<(), JsValue> {
+        // Track canvas backing-store resizes (the engine reassigns canvas.width/height on
+        // layout changes; the surface must be reconfigured to match or present fails).
+        let (cw, ch) = (self.canvas.width().max(1), self.canvas.height().max(1));
+        if cw != self.surface_config.width || ch != self.surface_config.height {
+            self.surface_config.width = cw;
+            self.surface_config.height = ch;
+            self.surface.configure(&self.device, &self.surface_config);
+        }
+
+        use wgpu::CurrentSurfaceTexture as Cst;
+        let frame = match self.surface.get_current_texture() {
+            Cst::Success(frame) | Cst::Suboptimal(frame) => frame,
+            // Timeout/Occluded: skip this frame cleanly, the loop retries next tick.
+            Cst::Timeout | Cst::Occluded => return Ok(()),
+            // Outdated/Lost/Validation: reconfigure and retry once; on a second failure
+            // skip the frame rather than erroring the whole engine.
+            Cst::Outdated | Cst::Lost | Cst::Validation => {
+                self.surface.configure(&self.device, &self.surface_config);
+                match self.surface.get_current_texture() {
+                    Cst::Success(frame) | Cst::Suboptimal(frame) => frame,
+                    _ => return Ok(()),
+                }
+            }
+        };
+        let surface_view = frame.texture.create_view(&Default::default());
+
+        if self.blit_bind_group.is_none() {
+            let compositor = self.compositor.as_ref().expect("compositor set in render");
+            self.blit_bind_group =
+                Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("preview-blit"),
+                    layout: &self.blit_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(compositor.output_view()),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&self.blit_sampler),
+                        },
+                    ],
+                }));
+        }
+        let bind_group = self.blit_bind_group.as_ref().expect("just built");
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("preview-blit"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("preview-blit"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &surface_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.blit_pipeline);
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        self.queue.present(frame);
+        Ok(())
+    }
+
+    fn ensure_media_texture(&mut self, key: &str, width: u32, height: u32) -> wgpu::Texture {
+        let stale = self
+            .media_textures
+            .get(key)
+            .is_none_or(|t| t.width != width || t.height != height);
+        if stale {
+            // COPY_DST + RENDER_ATTACHMENT are required destination usages for
+            // copyExternalImageToTexture per the WebGPU spec; TEXTURE_BINDING is what the
+            // compositor samples through.
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("preview-media"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::COPY_DST
+                    | wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            self.media_textures.insert(
+                key.to_string(),
+                MediaTexture {
+                    texture,
+                    width,
+                    height,
+                },
+            );
+        }
+        self.media_textures[key].texture.clone()
+    }
+}

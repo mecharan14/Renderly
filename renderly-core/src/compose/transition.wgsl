@@ -34,11 +34,14 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VsOut {
     return out;
 }
 
+// NOTE: textureSample must stay in uniform control flow (WGSL uniformity analysis — the
+// browser's WGSL compiler enforces it strictly for the wasm preview compositor, while
+// native naga is lenient). Sample unconditionally at a clamped uv, then select() black for
+// out-of-range coordinates instead of branching on the varying before the sample.
 fn sample_or_black(tex: texture_2d<f32>, uv: vec2<f32>) -> vec4<f32> {
-    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
-        return vec4(0.0, 0.0, 0.0, 1.0);
-    }
-    return textureSample(tex, samp, uv);
+    let inside = uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0;
+    let c = textureSample(tex, samp, clamp(uv, vec2(0.0), vec2(1.0)));
+    return select(vec4(0.0, 0.0, 0.0, 1.0), c, inside);
 }
 
 @fragment
@@ -75,23 +78,18 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if (params.kind == 5u) {
         return select(a, b, uv.y > (1.0 - u));
     }
-    // 6 slide_left
+    // 6 slide_left — both samples hoisted out of the varying-dependent branch (uniformity,
+    // see sample_or_black's note); select() picks per pixel.
     if (params.kind == 6u) {
-        let a_uv = uv + vec2(u, 0.0);
-        let b_uv = uv + vec2(u - 1.0, 0.0);
-        if (uv.x < (1.0 - u)) {
-            return sample_or_black(tex_a, a_uv);
-        }
-        return sample_or_black(tex_b, b_uv);
+        let sa = sample_or_black(tex_a, uv + vec2(u, 0.0));
+        let sb = sample_or_black(tex_b, uv + vec2(u - 1.0, 0.0));
+        return select(sb, sa, uv.x < (1.0 - u));
     }
     // 7 slide_right
     if (params.kind == 7u) {
-        let a_uv = uv - vec2(u, 0.0);
-        let b_uv = uv - vec2(u - 1.0, 0.0);
-        if (uv.x > u) {
-            return sample_or_black(tex_a, a_uv);
-        }
-        return sample_or_black(tex_b, b_uv);
+        let sa = sample_or_black(tex_a, uv - vec2(u, 0.0));
+        let sb = sample_or_black(tex_b, uv - vec2(u - 1.0, 0.0));
+        return select(sb, sa, uv.x > u);
     }
     // 8 iris
     if (params.kind == 8u) {

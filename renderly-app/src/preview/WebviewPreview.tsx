@@ -48,13 +48,20 @@ export function WebviewPreview({
   const playing = useEditorStore((s) => s.playing);
   const playhead = useEditorStore((s) => s.playhead);
 
-  // Engine lifecycle: created once per mount.
+  // Engine lifecycle: created once per mount. init() resolves the render-mode ladder
+  // (WebGPU wasm compositor → Canvas2D fallback, see webviewPreviewEngine.ts) — draws
+  // before it resolves are no-ops, and the state effects below re-fire afterwards anyway.
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const engine = new WebviewPreviewEngine(canvas, ipc.assetUrl);
     engineRef.current = engine;
     (globalThis as unknown as { __previewEngine?: WebviewPreviewEngine }).__previewEngine = engine;
+    void engine.init().then(() => {
+      // Push whatever state accumulated while the mode ladder resolved.
+      engine.setProject(useEditorStore.getState().project ?? null);
+      engine.seek(useEditorStore.getState().playhead);
+    });
     return () => {
       engine.dispose();
       engineRef.current = null;

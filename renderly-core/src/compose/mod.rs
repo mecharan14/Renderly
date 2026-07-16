@@ -39,9 +39,44 @@ pub struct LayerTransition {
     pub is_incoming: bool,
 }
 
-/// One composited layer: decoded (or caption) RGBA plus evaluated transform at frame time.
+/// Pixel source for one composited layer.
+///
+/// `Frame` is the native decode path (CPU RGBA uploaded through the pooled layer
+/// textures). `Texture` is the P2 wasm-preview path: an externally-owned GPU texture the
+/// browser filled via `Queue::copy_external_image_to_texture` from a `<video>`/`<img>`
+/// element — zero CPU readback (docs/preview-webview.md). Both variants run the exact same
+/// effect/mask/transition/composite passes after this point.
+pub enum LayerSource {
+    Frame(RgbaFrame),
+    /// Must be `Rgba8Unorm` with at least `TEXTURE_BINDING` usage, on the same device as
+    /// the compositor. The handle is cheap to clone (internally refcounted); the caller
+    /// keeps ownership and reuses it across frames.
+    Texture {
+        texture: wgpu::Texture,
+        width: u32,
+        height: u32,
+    },
+}
+
+impl LayerSource {
+    fn width(&self) -> u32 {
+        match self {
+            Self::Frame(f) => f.width,
+            Self::Texture { width, .. } => *width,
+        }
+    }
+
+    fn height(&self) -> u32 {
+        match self {
+            Self::Frame(f) => f.height,
+            Self::Texture { height, .. } => *height,
+        }
+    }
+}
+
+/// One composited layer: decoded (or caption) pixels plus evaluated transform at frame time.
 pub struct ComposeLayer {
-    pub frame: RgbaFrame,
+    pub source: LayerSource,
     pub transform: ClipTransform,
     /// Builtin effect instances (Phase 3.4). Empty / all-disabled → identity path.
     pub effects: Vec<EffectInstance>,
@@ -54,7 +89,7 @@ pub struct ComposeLayer {
 impl From<RgbaFrame> for ComposeLayer {
     fn from(frame: RgbaFrame) -> Self {
         Self {
-            frame,
+            source: LayerSource::Frame(frame),
             transform: ClipTransform::default(),
             effects: Vec::new(),
             mask: None,
@@ -625,59 +660,65 @@ impl Compositor {
         encoder: &mut wgpu::CommandEncoder,
         keep_alive: &mut Vec<wgpu::Texture>,
     ) -> Result<(), ComposeError> {
-        let frame = &layer.frame;
-        let texture = match self.layer_pool.take(frame.width, frame.height) {
-            Some(texture) => {
-                upload_layer_pixels(
-                    &self.queue,
-                    &texture,
-                    frame.width,
-                    frame.height,
-                    &frame.pixels,
-                );
-                texture
+        let src_w = layer.source.width();
+        let src_h = layer.source.height();
+        // Frame sources go through the pooled upload textures (returned to the pool after
+        // submit via `keep_alive`); Texture sources are externally owned and bound directly
+        // — the caller keeps them alive across the frame, so they never enter the pool.
+        let uploaded_view = match &layer.source {
+            LayerSource::Frame(frame) => {
+                let texture = match self.layer_pool.take(frame.width, frame.height) {
+                    Some(texture) => {
+                        upload_layer_pixels(
+                            &self.queue,
+                            &texture,
+                            frame.width,
+                            frame.height,
+                            &frame.pixels,
+                        );
+                        texture
+                    }
+                    None => self.device.create_texture_with_data(
+                        &self.queue,
+                        &wgpu::TextureDescriptor {
+                            label: Some("layer"),
+                            size: wgpu::Extent3d {
+                                width: frame.width,
+                                height: frame.height,
+                                depth_or_array_layers: 1,
+                            },
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: wgpu::TextureFormat::Rgba8Unorm,
+                            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                                | wgpu::TextureUsages::COPY_DST,
+                            view_formats: &[],
+                        },
+                        wgpu::util::TextureDataOrder::LayerMajor,
+                        &frame.pixels,
+                    ),
+                };
+                let view = texture.create_view(&Default::default());
+                keep_alive.push(texture);
+                view
             }
-            None => self.device.create_texture_with_data(
-                &self.queue,
-                &wgpu::TextureDescriptor {
-                    label: Some("layer"),
-                    size: wgpu::Extent3d {
-                        width: frame.width,
-                        height: frame.height,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                    view_formats: &[],
-                },
-                wgpu::util::TextureDataOrder::LayerMajor,
-                &frame.pixels,
-            ),
+            LayerSource::Texture { texture, .. } => texture.create_view(&Default::default()),
         };
-        let uploaded_view = texture.create_view(&Default::default());
 
         let use_effects = self.effects.apply(
             &self.device,
             &self.queue,
             encoder,
             &uploaded_view,
-            frame.width,
-            frame.height,
+            src_w,
+            src_h,
             &layer.effects,
             layer.mask.as_ref(),
             packs,
         )?;
 
-        let params = layer_params(
-            frame.width,
-            frame.height,
-            self.width,
-            self.height,
-            &layer.transform,
-        );
+        let params = layer_params(src_w, src_h, self.width, self.height, &layer.transform);
         let params_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -749,7 +790,6 @@ impl Compositor {
             pass.draw(0..6, 0..1);
         }
 
-        keep_alive.push(texture);
         Ok(())
     }
 }
@@ -917,7 +957,7 @@ mod tests {
         };
         let frame = solid_frame(16, 16, 40, 80, 120);
         let layers = [ComposeLayer {
-            frame: frame.clone(),
+            source: LayerSource::Frame(frame.clone()),
             transform: ClipTransform::default(),
             effects: vec![],
             mask: None,
@@ -927,7 +967,7 @@ mod tests {
         c.compose_to_texture(
             &[],
             &[ComposeLayer {
-                frame,
+                source: LayerSource::Frame(frame),
                 transform: ClipTransform::default(),
                 effects: vec![],
                 mask: None,
@@ -941,7 +981,7 @@ mod tests {
             .composite(
                 &[],
                 &[ComposeLayer {
-                    frame: solid_frame(16, 16, 40, 80, 120),
+                    source: LayerSource::Frame(solid_frame(16, 16, 40, 80, 120)),
                     transform: ClipTransform::default(),
                     effects: vec![],
                     mask: None,
@@ -965,7 +1005,7 @@ mod tests {
             .composite(
                 &[],
                 &[ComposeLayer {
-                    frame: frame.clone(),
+                    source: LayerSource::Frame(frame.clone()),
                     transform: ClipTransform::default(),
                     effects: vec![],
                     mask: None,
@@ -977,7 +1017,7 @@ mod tests {
             .composite(
                 &[],
                 &[ComposeLayer {
-                    frame,
+                    source: LayerSource::Frame(frame),
                     transform: ClipTransform::default(),
                     effects: vec![effect(
                         "builtin:color_adjust",
@@ -1008,7 +1048,7 @@ mod tests {
             .composite(
                 &[],
                 &[ComposeLayer {
-                    frame: frame.clone(),
+                    source: LayerSource::Frame(frame.clone()),
                     transform: ClipTransform::default(),
                     effects: vec![],
                     mask: None,
@@ -1020,7 +1060,7 @@ mod tests {
             .composite(
                 &[],
                 &[ComposeLayer {
-                    frame: frame.clone(),
+                    source: LayerSource::Frame(frame.clone()),
                     transform: ClipTransform::default(),
                     effects: vec![],
                     mask: None,
@@ -1039,7 +1079,7 @@ mod tests {
             .composite(
                 &[],
                 &[ComposeLayer {
-                    frame,
+                    source: LayerSource::Frame(frame),
                     transform: ClipTransform::default(),
                     effects: vec![disabled],
                     mask: None,
@@ -1062,7 +1102,7 @@ mod tests {
             .composite(
                 &[],
                 &[ComposeLayer {
-                    frame: frame.clone(),
+                    source: LayerSource::Frame(frame.clone()),
                     transform: ClipTransform::default(),
                     effects: vec![],
                     mask: None,
@@ -1074,7 +1114,7 @@ mod tests {
             .composite(
                 &[],
                 &[ComposeLayer {
-                    frame,
+                    source: LayerSource::Frame(frame),
                     transform: ClipTransform::default(),
                     effects: vec![effect(
                         "builtin:blur",
@@ -1087,6 +1127,55 @@ mod tests {
             .unwrap();
         // radius 0 skips the blur passes entirely → bit-exact identity.
         assert_eq!(identity, blurred);
+    }
+
+    #[test]
+    fn transition_pair_blends_mid_progress() {
+        let mut c = match Compositor::new(16, 16) {
+            Ok(c) => c,
+            Err(ComposeError::NoAdapter) => return,
+            Err(e) => panic!("{e}"),
+        };
+        let red = solid_frame(16, 16, 255, 0, 0);
+        let blue = solid_frame(16, 16, 0, 0, 255);
+        let out = c
+            .composite(
+                &[],
+                &[
+                    ComposeLayer {
+                        source: LayerSource::Frame(red),
+                        transform: ClipTransform::default(),
+                        effects: vec![],
+                        mask: None,
+                        transition: Some(LayerTransition {
+                            kind: TransitionKind::Crossfade,
+                            progress: 0.5,
+                            is_incoming: false,
+                        }),
+                    },
+                    ComposeLayer {
+                        source: LayerSource::Frame(blue),
+                        transform: ClipTransform::default(),
+                        effects: vec![],
+                        mask: None,
+                        transition: Some(LayerTransition {
+                            kind: TransitionKind::Crossfade,
+                            progress: 0.5,
+                            is_incoming: true,
+                        }),
+                    },
+                ],
+            )
+            .unwrap();
+        let px = &out[..4];
+        assert!(
+            px[0] > 90 && px[0] < 165,
+            "red channel should be ~127 (pixel {px:?})",
+        );
+        assert!(
+            px[2] > 90 && px[2] < 165,
+            "blue channel should be ~127 (pixel {px:?})",
+        );
     }
 
     #[test]

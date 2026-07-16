@@ -1,13 +1,44 @@
-// P1 webview preview engine: renders the timeline into a plain <canvas> using browser-
-// native decode (<video>/<img> elements), no engine round trip. See docs/preview-webview.md
-// for the architecture/why. This is a mirror of renderly-core's timeline evaluation
-// (clip lookup, source-time math) and compose/mod.rs's cover-fit + user-transform math
-// (see cover_uv / layer_params) — NOT a reimplementation of effects (P1 explicitly does
-// not render effects/masks/LUTs/captions; that's P2's WASM compositor, see
-// docs/preview-webview.md "Non-negotiables" #1).
+// Webview preview engine. Two render modes behind one element-management layer:
+//
+// - "webgpu" (P2): browser-decoded <video>/<img> elements are handed to renderly-core's
+//   actual compositor compiled to wasm32 (renderly-wasm's WasmCompositor) — effects,
+//   transitions, masks, chroma, and keyframed animation render with the SAME Rust/WGSL
+//   code paths as native export (docs/preview-webview.md "Non-negotiables" #1). Frames
+//   travel element → GPU texture via copyExternalImageToTexture (zero CPU readback).
+// - "canvas2d" (P1 fallback): a Canvas2D mirror of core's timeline evaluation and
+//   cover-fit + transform math. No effects/masks/LUTs/captions — kept as the graceful-
+//   degradation path when WebGPU or the wasm module is unavailable.
+//
+// The element pool, dual-mode clock (backend playback:tick slew / standalone rAF),
+// pre-seek, and seek-correction logic below are shared by both modes.
 
 import type { Clip, ClipTransform, MediaClip, MediaItem, Project } from "../lib/types";
 import { IDENTITY_TRANSFORM, clipDurationSecs } from "../lib/types";
+
+/// Minimal structural type for renderly-wasm's WasmCompositor (the real .d.ts lives in the
+/// gitignored generated pkg, so we don't import its types at build time).
+interface WasmCompositorLike {
+  set_project(json: string): void;
+  render(timeSecs: number, sources: object): void;
+  free(): void;
+}
+
+export type PreviewMode = "webgpu" | "canvas2d" | "native";
+
+/// Serializes WasmCompositor creation across engine instances. React StrictMode (dev)
+/// mounts each component twice: engine #1 starts its async init, is disposed, and engine
+/// #2 inits on the SAME canvas — two concurrent WebGPU surface creations on one canvas
+/// deadlock. Queueing init sections lets #1 finish (and immediately free its compositor
+/// because it's disposed) before #2 touches the canvas.
+let initQueue: Promise<void> = Promise.resolve();
+function enqueueInit<T>(work: () => Promise<T>): Promise<T> {
+  const run = initQueue.then(work);
+  initQueue = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
 
 /// localStorage flag: set to "native" to opt back into the native wgpu child-window
 /// preview (fallback during the migration — see docs/preview-webview.md phase P3/P4).
@@ -29,6 +60,10 @@ export interface PreviewStats {
   fps: number;
   drawMs: number;
   drops: number;
+  /// Which pixel path is live: "webgpu" (wasm compositor), "canvas2d" (P1 fallback).
+  /// The "native" value is never reported by this engine — the native child-window path
+  /// doesn't instantiate it at all (see isWebviewPreview()).
+  mode: PreviewMode;
 }
 
 type ActiveLayer = {
@@ -86,6 +121,50 @@ function upcomingLayers(project: Project, t: number, horizonSecs: number): Activ
   return layers;
 }
 
+/// During a transition window [cut - d, cut), renderly-core's eval emits BOTH the outgoing
+/// and the incoming clip (see compose/eval.rs). `activeLayersAt` above only returns the
+/// covering (outgoing) clip, so in webgpu mode the incoming clip's element must be managed
+/// separately — this mirrors eval.rs's window math for ELEMENT MANAGEMENT ONLY (which
+/// <video> to play/seek); the compositing decision itself stays in Rust.
+///
+/// Known limitation: when both sides of a transition reference the SAME media item (e.g. a
+/// split clip), they share one <video> element, so both sides sample the same frame during
+/// the window (the native path opens a second decoder; a second pooled element per
+/// media×window is future work).
+function transitionIncomingLayers(project: Project, t: number): ActiveLayer[] {
+  const layers: ActiveLayer[] = [];
+  for (const track of project.tracks) {
+    if (track.kind !== "video" || track.hidden) continue;
+    const clips = (track.clips as Clip[])
+      .filter((c): c is MediaClip => c.type === "video" && c.enabled)
+      .sort((a, b) => a.position_secs - b.position_secs);
+    for (let i = 0; i < clips.length; i++) {
+      const v = clips[i];
+      const tr = v.outgoing_transition;
+      if (!tr || tr.duration_secs <= 0) continue;
+      const end = v.position_secs + clipDurationSecs(v);
+      const windowStart = end - tr.duration_secs;
+      if (t < windowStart || t >= end) continue;
+      const incoming = clips[i + 1];
+      if (!incoming) continue;
+      if (Math.abs(incoming.position_secs - end) > 0.05 && incoming.position_secs < end - 1e-6) {
+        continue;
+      }
+      const media = project.media.find((m) => m.id === incoming.media_id);
+      if (!media) continue;
+      const speed = incoming.speed && incoming.speed > 0 ? incoming.speed : 1;
+      layers.push({
+        trackId: track.id,
+        clip: incoming,
+        media,
+        sourceTimeSecs: incoming.source_in_secs + (t - windowStart) * speed,
+      });
+      break;
+    }
+  }
+  return layers;
+}
+
 /// Mirror of `cover_uv` in renderly-core/src/compose/mod.rs, expressed as a pixel-space
 /// crop rect on the source instead of a UV scale/offset — equivalent math, just phrased
 /// for `ctx.drawImage`'s 9-arg form.
@@ -116,7 +195,13 @@ const DRIFT_SLEW_FACTOR = 0.2;
 
 export class WebviewPreviewEngine {
   private canvas: HTMLCanvasElement;
-  private ctx: CanvasRenderingContext2D;
+  /// Canvas2D context — only acquired in "canvas2d" mode (a canvas can hold either a "2d"
+  /// or a "webgpu" context, never both, so the mode decision in init() must come first).
+  private ctx: CanvasRenderingContext2D | null = null;
+  private gpu: WasmCompositorLike | null = null;
+  private modeValue: PreviewMode = "canvas2d";
+  private ready = false;
+  private gpuRenderErrorLogged = false;
   private project: Project | null = null;
   private assetUrl: (path: string) => string;
 
@@ -146,11 +231,104 @@ export class WebviewPreviewEngine {
 
   constructor(canvas: HTMLCanvasElement, assetUrl: (path: string) => string) {
     this.canvas = canvas;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) throw new Error("2d context unavailable");
-    this.ctx = ctx;
     this.assetUrl = assetUrl;
     this.statsWindowStart = performance.now();
+  }
+
+  get mode(): PreviewMode {
+    return this.modeValue;
+  }
+
+  /// Decide the render mode (graceful-degradation ladder, docs/preview-webview.md):
+  /// WebGPU adapter available AND the wasm module loads AND WasmCompositor::create
+  /// succeeds → "webgpu"; any missing rung → the P1 Canvas2D path. Must run before the
+  /// first draw — no context is acquired until the ladder resolves (see `ctx` doc).
+  async init(): Promise<void> {
+    return enqueueInit(() => this.initInner());
+  }
+
+  private async initInner(): Promise<void> {
+    if (this.disposed) return;
+    try {
+      // Feature-detect BEFORE touching the canvas: requestAdapter() on a spare probe
+      // keeps the real canvas 2d-capable when WebGPU is absent/denied (a canvas that has
+      // ever produced a "webgpu" context can never produce a "2d" one).
+      const gpuApi = (navigator as { gpu?: { requestAdapter(): Promise<unknown | null> } }).gpu;
+      let adapter = gpuApi ? await gpuApi.requestAdapter() : null;
+      if (gpuApi && !adapter) {
+        // requestAdapter can transiently return null during page-load GPU contention
+        // (observed in the automated harness pane) — one short retry before giving up.
+        await new Promise((r) => setTimeout(r, 300));
+        adapter = await gpuApi.requestAdapter();
+      }
+      if (!adapter) {
+        console.warn(
+          "[preview] WebGPU adapter unavailable (navigator.gpu " +
+            (gpuApi ? "present" : "missing") +
+            ") — falling back to Canvas2D",
+        );
+      }
+      if (adapter) {
+        // Runtime-resolved dev-server path, deliberately invisible to Vite's static
+        // analysis (@vite-ignore + no import.meta.url — Vite constant-folds concats and
+        // globs dynamic `new URL` templates, either of which would make the build depend
+        // on the gitignored generated pkg). The Vite dev server serves project sources
+        // under /src, so this resolves in real-app dev mode (Tauri dev uses the dev
+        // server) and in the browser harness. In a production bundle it 404s and throws →
+        // Canvas2D fallback (bundling the pkg into dist is P3 work, when the wasm path
+        // becomes the shipped default — see docs/preview-webview.md P2 "build step").
+        const spec = "/src/wasm-pkg/renderly_wasm.js";
+        const mod = (await import(/* @vite-ignore */ spec)) as {
+          default: () => Promise<unknown>;
+          WasmCompositor: { create(canvas: HTMLCanvasElement): Promise<WasmCompositorLike> };
+        };
+        await mod.default();
+        if (this.disposed) return; // unmounted while the module loaded
+        this.gpu = await mod.WasmCompositor.create(this.canvas);
+        this.modeValue = "webgpu";
+      }
+    } catch (err) {
+      console.warn("[preview] WebGPU path unavailable, falling back to Canvas2D:", err);
+      this.gpu = null;
+    }
+    if (this.disposed) {
+      // Disposed while awaiting (e.g. React StrictMode's immediate unmount): release the
+      // GPU surface right away so the successor engine can claim the canvas.
+      if (this.gpu) {
+        try {
+          this.gpu.free();
+        } catch {
+          /* already freed */
+        }
+        this.gpu = null;
+      }
+      return;
+    }
+    if (this.gpu && this.project) {
+      // Outside the ladder try/catch: once the canvas has a webgpu context it can never
+      // produce a 2d one, so a bad project JSON must NOT flip us onto the (impossible)
+      // Canvas2D rung — log it and keep the GPU surface alive for the next set_project.
+      try {
+        this.gpu.set_project(JSON.stringify(this.project));
+      } catch (err) {
+        console.error("[preview] initial set_project failed:", err);
+      }
+    }
+    if (!this.gpu) {
+      const ctx = this.canvas.getContext("2d");
+      if (!ctx) throw new Error("2d context unavailable");
+      this.ctx = ctx;
+      this.modeValue = "canvas2d";
+      this.applyCanvasTransform();
+    }
+    this.ready = true;
+    this.drawFrame(this.currentTimeSecs());
+  }
+
+  private applyCanvasTransform(): void {
+    if (!this.ctx) return;
+    const dpr = window.devicePixelRatio || 1;
+    this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   }
 
   /// Resize the backing bitmap. Only reassigns `canvas.width`/`.height` when the target
@@ -165,8 +343,10 @@ export class WebviewPreviewEngine {
     if (this.canvas.width !== targetW || this.canvas.height !== targetH) {
       this.canvas.width = targetW;
       this.canvas.height = targetH;
+      // In webgpu mode the wasm side reconfigures its surface to the new backing size on
+      // the next present (WasmCompositor::present tracks canvas.width/height).
     }
-    this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    this.applyCanvasTransform();
     this.cssW = cssW;
     this.cssH = cssH;
     // Repaint immediately at the current time so a resize doesn't show a stale frame.
@@ -176,6 +356,14 @@ export class WebviewPreviewEngine {
   setProject(project: Project | null): void {
     this.project = project;
     this.reconcileMediaElements();
+    if (this.gpu && project) {
+      // Same serde schema as the project file — the store holds the Rust project verbatim.
+      try {
+        this.gpu.set_project(JSON.stringify(project));
+      } catch (err) {
+        console.error("[preview] set_project failed:", err);
+      }
+    }
     this.drawFrame(this.currentTimeSecs());
   }
 
@@ -306,62 +494,57 @@ export class WebviewPreviewEngine {
   };
 
   private drawFrame(t: number): void {
+    if (!this.ready) return;
     const drawStart = performance.now();
-    const { ctx, cssW, cssH } = this;
-    ctx.save();
-    ctx.clearRect(0, 0, cssW, cssH);
-    ctx.fillStyle = "#000";
-    ctx.fillRect(0, 0, cssW, cssH);
 
     const project = this.project;
-    if (project && cssW > 0 && cssH > 0) {
-      const active = activeLayersAt(project, t);
-      const activeIds = new Set(active.map((l) => l.media.id));
+    const active = project ? activeLayersAt(project, t) : [];
+    if (project) this.manageElements(project, t, active);
 
-      // Pre-seek upcoming clips' videos so the cut is gapless.
-      for (const upcoming of upcomingLayers(project, t, PRESEEK_HORIZON_SECS)) {
-        const video = this.videoPool.get(upcoming.media.id);
-        if (!video || activeIds.has(upcoming.media.id)) continue;
-        if (Math.abs(video.currentTime - upcoming.sourceTimeSecs) > SEEK_CORRECT_THRESHOLD_SECS) {
-          try {
-            video.currentTime = upcoming.sourceTimeSecs;
-          } catch {
-            /* not seekable yet (metadata not loaded) — next frame will retry */
+    if (this.gpu) {
+      // GPU path: hand every pooled element to the wasm compositor keyed by media id —
+      // renderly-core's eval::active_layers (the SAME evaluation export uses) decides
+      // which of them are composited, with what params. Nothing timeline-shaped is
+      // decided on the JS side in this mode; `active` above only drove element readiness.
+      const sources: Record<string, HTMLVideoElement | HTMLImageElement> = {};
+      for (const [id, video] of this.videoPool) sources[id] = video;
+      for (const [id, img] of this.imgPool) sources[id] = img;
+      try {
+        this.gpu.render(t, sources);
+        this.gpuRenderErrorLogged = false;
+      } catch (err) {
+        if (!this.gpuRenderErrorLogged) {
+          this.gpuRenderErrorLogged = true;
+          console.error("[preview] wasm render failed (will keep retrying):", err);
+        }
+      }
+    } else if (this.ctx) {
+      const { ctx, cssW, cssH } = this;
+      ctx.save();
+      ctx.clearRect(0, 0, cssW, cssH);
+      ctx.fillStyle = "#000";
+      ctx.fillRect(0, 0, cssW, cssH);
+      if (project && cssW > 0 && cssH > 0) {
+        for (const layer of active) {
+          const transform: ClipTransform = layer.clip.transform ?? IDENTITY_TRANSFORM;
+          if (layer.media.kind === "video") {
+            const video = this.videoPool.get(layer.media.id);
+            if (!video || video.readyState < 2) continue;
+            this.drawLayer(
+              video,
+              video.videoWidth || layer.media.width || 1,
+              video.videoHeight || layer.media.height || 1,
+              transform,
+            );
+          } else if (layer.media.kind === "image") {
+            const img = this.imgPool.get(layer.media.id);
+            if (!img || !img.complete || img.naturalWidth === 0) continue;
+            this.drawLayer(img, img.naturalWidth, img.naturalHeight, transform);
           }
         }
       }
-
-      // Pause any video that isn't part of this frame's active set.
-      for (const [id, video] of this.videoPool) {
-        if (!activeIds.has(id) && !video.paused) video.pause();
-      }
-
-      for (const layer of active) {
-        const transform: ClipTransform = layer.clip.transform ?? IDENTITY_TRANSFORM;
-        if (layer.media.kind === "video") {
-          const video = this.videoPool.get(layer.media.id);
-          if (!video || video.readyState < 2) continue;
-          const speed = layer.clip.speed && layer.clip.speed > 0 ? layer.clip.speed : 1;
-          if (video.playbackRate !== speed) video.playbackRate = speed;
-          const drift = Math.abs(video.currentTime - layer.sourceTimeSecs);
-          if (drift > SEEK_CORRECT_THRESHOLD_SECS) {
-            try {
-              video.currentTime = layer.sourceTimeSecs;
-            } catch {
-              /* ignore */
-            }
-          }
-          if (this.playing && video.paused) void video.play().catch(() => {});
-          if (!this.playing && !video.paused) video.pause();
-          this.drawLayer(video, video.videoWidth || layer.media.width || 1, video.videoHeight || layer.media.height || 1, transform);
-        } else if (layer.media.kind === "image") {
-          const img = this.imgPool.get(layer.media.id);
-          if (!img || !img.complete || img.naturalWidth === 0) continue;
-          this.drawLayer(img, img.naturalWidth, img.naturalHeight, transform);
-        }
-      }
+      ctx.restore();
     }
-    ctx.restore();
 
     // Stats (dev only) — see docs/preview-webview.md harness verification.
     this.lastDrawT = performance.now() - drawStart;
@@ -375,7 +558,7 @@ export class WebviewPreviewEngine {
     const elapsed = performance.now() - this.statsWindowStart;
     if (elapsed >= 1000) {
       const fps = (this.frameCount * 1000) / elapsed;
-      this.publishStats({ fps, drawMs: this.lastDrawT, drops: this.drops });
+      this.publishStats({ fps, drawMs: this.lastDrawT, drops: this.drops, mode: this.modeValue });
       this.frameCount = 0;
       this.statsWindowStart = performance.now();
     } else {
@@ -383,7 +566,54 @@ export class WebviewPreviewEngine {
         fps: (globalThis as { __previewStats?: PreviewStats }).__previewStats?.fps ?? 0,
         drawMs: this.lastDrawT,
         drops: this.drops,
+        mode: this.modeValue,
       });
+    }
+  }
+
+  /// Shared element management for both render modes: pre-seek upcoming clips, pause
+  /// inactive videos, and keep each active video's currentTime/playbackRate/play-state in
+  /// sync with the timeline. In webgpu mode this ALSO covers transition-incoming clips
+  /// (see `transitionIncomingLayers`) so both sides of a WGSL transition blend have live
+  /// decoded frames.
+  private manageElements(project: Project, t: number, active: ActiveLayer[]): void {
+    const managed = this.gpu ? [...active, ...transitionIncomingLayers(project, t)] : active;
+    const activeIds = new Set(managed.map((l) => l.media.id));
+
+    // Pre-seek upcoming clips' videos so the cut is gapless.
+    for (const upcoming of upcomingLayers(project, t, PRESEEK_HORIZON_SECS)) {
+      const video = this.videoPool.get(upcoming.media.id);
+      if (!video || activeIds.has(upcoming.media.id)) continue;
+      if (Math.abs(video.currentTime - upcoming.sourceTimeSecs) > SEEK_CORRECT_THRESHOLD_SECS) {
+        try {
+          video.currentTime = upcoming.sourceTimeSecs;
+        } catch {
+          /* not seekable yet (metadata not loaded) — next frame will retry */
+        }
+      }
+    }
+
+    // Pause any video that isn't part of this frame's active set.
+    for (const [id, video] of this.videoPool) {
+      if (!activeIds.has(id) && !video.paused) video.pause();
+    }
+
+    for (const layer of managed) {
+      if (layer.media.kind !== "video") continue;
+      const video = this.videoPool.get(layer.media.id);
+      if (!video || video.readyState < 2) continue;
+      const speed = layer.clip.speed && layer.clip.speed > 0 ? layer.clip.speed : 1;
+      if (video.playbackRate !== speed) video.playbackRate = speed;
+      const drift = Math.abs(video.currentTime - layer.sourceTimeSecs);
+      if (drift > SEEK_CORRECT_THRESHOLD_SECS) {
+        try {
+          video.currentTime = layer.sourceTimeSecs;
+        } catch {
+          /* ignore */
+        }
+      }
+      if (this.playing && video.paused) void video.play().catch(() => {});
+      if (!this.playing && !video.paused) video.pause();
     }
   }
 
@@ -394,6 +624,7 @@ export class WebviewPreviewEngine {
     transform: ClipTransform,
   ): void {
     const { ctx, cssW, cssH } = this;
+    if (!ctx) return;
     const { sx, sy, sw, sh } = coverSourceRect(srcW, srcH, cssW, cssH);
     ctx.save();
     ctx.globalAlpha = Math.max(0, Math.min(1, transform.opacity));
@@ -416,6 +647,14 @@ export class WebviewPreviewEngine {
   dispose(): void {
     this.disposed = true;
     this.cancelScheduledFrame();
+    if (this.gpu) {
+      try {
+        this.gpu.free();
+      } catch {
+        /* already freed */
+      }
+      this.gpu = null;
+    }
     for (const v of this.videoPool.values()) {
       v.pause();
       v.removeAttribute("src");

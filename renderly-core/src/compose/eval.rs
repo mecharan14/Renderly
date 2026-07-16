@@ -33,6 +33,9 @@ pub struct ActiveLayer {
     /// Decoder/element cache key (usually track id; crossfade incoming uses a derived key so
     /// two decoders/elements can be open at once during a transition).
     pub decoder_key: uuid::Uuid,
+    /// The media item this layer samples — the wasm preview keys its `<video>`/`<img>`
+    /// element pool by media id (the native path keys decoders by `decoder_key`/`path`).
+    pub media_id: uuid::Uuid,
     pub path: PathBuf,
     pub source_time: f64,
     pub transform: ClipTransform,
@@ -117,6 +120,7 @@ pub fn active_layers(project: &Project, t: f64) -> Result<Vec<ActiveLayer>, Eval
 
             layers.push(ActiveLayer {
                 decoder_key: track.id,
+                media_id: v.media_id,
                 path: out_media.path.clone(),
                 source_time: v.source_time_at(t),
                 transform: out_xf,
@@ -132,6 +136,7 @@ pub fn active_layers(project: &Project, t: f64) -> Result<Vec<ActiveLayer>, Eval
             layers.push(ActiveLayer {
                 // Distinct from track.id so decoders/elements keep a second stream open.
                 decoder_key: uuid::Uuid::from_u128(track.id.as_u128() ^ 0xC0_FF_EE_51_u128),
+                media_id: incoming.media_id,
                 path: in_media.path.clone(),
                 source_time: incoming.source_in_secs + (t - window_start) * incoming.speed_factor(),
                 transform: in_xf,
@@ -167,6 +172,7 @@ pub fn active_layers(project: &Project, t: f64) -> Result<Vec<ActiveLayer>, Eval
                 }
                 layers.push(ActiveLayer {
                     decoder_key: track.id,
+                    media_id: v.media_id,
                     path: media.path.clone(),
                     source_time: v.source_time_at(t),
                     transform: evaluate_transform(v, t),

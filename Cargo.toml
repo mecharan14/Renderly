@@ -5,6 +5,10 @@ members = [
     "renderly-cli",
     "renderly-mcp",
     "renderly-app/src-tauri",
+    # wasm32-only bindings (webview preview compositor, docs/preview-webview.md P2). All of
+    # its real dependencies are target-gated to wasm32, so it builds as an empty lib on the
+    # native target — `cargo build/test --workspace` stays green without excluding it.
+    "renderly-wasm",
 ]
 
 [workspace.package]
