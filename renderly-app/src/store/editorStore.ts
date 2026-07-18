@@ -56,7 +56,15 @@ function applyProjectPatch(
   if (!current) return false;
   try {
     const clone = structuredClone(current) as Project;
-    applyPatch(clone as object, patch as Operation[], true, false);
+    // `clone` is a private, disposable copy (from structuredClone above), so mutating it
+    // in place is safe — and required: with `mutateDocument=false`, fast-json-patch
+    // clones the document *itself* internally and returns the patched result via
+    // `.newDocument`, leaving the `clone` we pass in untouched. That previously meant
+    // this function reported success (no throw) while silently keeping `clone` — and
+    // therefore the store's `project` — identical in content to the pre-patch state,
+    // just under a new object reference. React re-rendered (new reference), but with
+    // stale data, which is exactly bug 1/2's "doesn't show until reopen" symptom.
+    applyPatch(clone as object, patch as Operation[], true, true);
     set({ project: clone, clientRevision: revision });
     return true;
   } catch (e) {

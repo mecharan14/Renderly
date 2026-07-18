@@ -2,7 +2,8 @@
 // vite.harness.config.ts so the real app (which needs a running Tauri backend) can be
 // rendered and iterated on in a plain browser. Never imported by the production build.
 
-import type { Project } from "../lib/types";
+import { compare } from "fast-json-patch";
+import type { Clip, MediaClip, Project, Track } from "../lib/types";
 
 // P2: the Rust project schema types every id as a UUID, and the wasm compositor's
 // set_project parses the store project with serde — so the sample project's ids must be
@@ -100,6 +101,189 @@ const extensionCatalog = {
 
 let revision = 1;
 
+// ---- Mutable project state + a tiny command applier, so `apply_command`/`apply_commands`
+// below can echo a REAL RFC-6902 patch (via fast-json-patch's `compare`, the same diff
+// approach the real backend's `json_patch::diff` uses) instead of the empty `patch: []`
+// this mock used to return unconditionally. That distinction matters: the store
+// (editorStore.ts's `dispatch`/`dispatchBatch`) applies the returned patch itself and
+// skips its post-mutation refetch — an empty patch made every mock-driven edit silently
+// no-op the store's project, which would have hidden bug 1/2's real root cause (a broken
+// `applyPatch` call) from harness testing. Only the command shapes exercised by the app's
+// UI/harness scripts are implemented; unrecognized commands log a warning and no-op rather
+// than throwing, so an unhandled command degrades to "nothing visibly changed" instead of
+// breaking the mock's other commands or hanging the promise.
+let currentProject: Project = structuredClone(sampleProject);
+
+function mockFindTrack(project: Project, trackId: string): Track | undefined {
+  return project.tracks.find((t) => t.id === trackId);
+}
+
+function mockFindClip(track: Track | undefined, clipId: string): Clip | undefined {
+  return track?.clips.find((c) => c.id === clipId);
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function applyMockCommand(project: Project, cmd: any): void {
+  switch (cmd.command) {
+    case "AddTrack": {
+      const track: Track = {
+        id: cmd.id ?? crypto.randomUUID(),
+        kind: cmd.kind,
+        name: cmd.name,
+        muted: false,
+        locked: false,
+        hidden: false,
+        clips: [],
+      };
+      project.tracks.push(track);
+      break;
+    }
+    case "AddClip": {
+      const track = mockFindTrack(project, cmd.track_id);
+      const media = project.media.find((m) => m.id === cmd.media_id);
+      if (!track || !media) break;
+      const clip: MediaClip = {
+        type: media.kind === "audio" ? "audio" : "video",
+        id: crypto.randomUUID(),
+        media_id: cmd.media_id,
+        position_secs: cmd.position_secs,
+        source_in_secs: cmd.source_in_secs,
+        source_out_secs: cmd.source_out_secs,
+        gain_db: 0,
+        enabled: true,
+        fade_in_secs: 0,
+        fade_out_secs: 0,
+      };
+      track.clips.push(clip);
+      break;
+    }
+    case "AddCaption": {
+      const track = mockFindTrack(project, cmd.track_id);
+      if (!track) break;
+      track.clips.push({
+        type: "caption",
+        id: crypto.randomUUID(),
+        text: cmd.text,
+        position_secs: cmd.position_secs,
+        duration_secs: cmd.duration_secs,
+        style_id: cmd.style_id,
+      });
+      break;
+    }
+    case "DeleteClip": {
+      const track = mockFindTrack(project, cmd.track_id);
+      if (!track) break;
+      track.clips = track.clips.filter((c) => c.id !== cmd.clip_id);
+      break;
+    }
+    case "DeleteTrack": {
+      project.tracks = project.tracks.filter((t) => t.id !== cmd.track_id);
+      break;
+    }
+    case "RenameTrack": {
+      const track = mockFindTrack(project, cmd.track_id);
+      if (track) track.name = cmd.name;
+      break;
+    }
+    case "SetTrackFlags": {
+      const track = mockFindTrack(project, cmd.track_id);
+      if (!track) break;
+      if (cmd.muted != null) track.muted = cmd.muted;
+      if (cmd.locked != null) track.locked = cmd.locked;
+      if (cmd.hidden != null) track.hidden = cmd.hidden;
+      break;
+    }
+    case "SetClipEnabled": {
+      const clip = mockFindClip(mockFindTrack(project, cmd.track_id), cmd.clip_id);
+      if (clip && clip.type !== "caption") clip.enabled = cmd.enabled;
+      break;
+    }
+    case "SetClipTransform": {
+      const clip = mockFindClip(mockFindTrack(project, cmd.track_id), cmd.clip_id);
+      if (clip && clip.type !== "caption") clip.transform = cmd.transform;
+      break;
+    }
+    case "SetClipKeyframes": {
+      const clip = mockFindClip(mockFindTrack(project, cmd.track_id), cmd.clip_id);
+      if (clip && clip.type !== "caption") clip.keyframes = cmd.keyframes;
+      break;
+    }
+    case "SetClipEffects": {
+      const clip = mockFindClip(mockFindTrack(project, cmd.track_id), cmd.clip_id);
+      if (clip && clip.type !== "caption") clip.effects = cmd.effects;
+      break;
+    }
+    case "SetClipTransition": {
+      const clip = mockFindClip(mockFindTrack(project, cmd.track_id), cmd.clip_id);
+      if (clip && clip.type !== "caption") clip.outgoing_transition = cmd.transition;
+      break;
+    }
+    case "SetClipSpeed": {
+      const clip = mockFindClip(mockFindTrack(project, cmd.track_id), cmd.clip_id);
+      if (clip && clip.type !== "caption") clip.speed = cmd.speed;
+      break;
+    }
+    case "SetAudioGain": {
+      const clip = mockFindClip(mockFindTrack(project, cmd.track_id), cmd.clip_id);
+      if (clip && clip.type !== "caption") clip.gain_db = cmd.gain_db;
+      break;
+    }
+    case "SetAudioFade": {
+      const clip = mockFindClip(mockFindTrack(project, cmd.track_id), cmd.clip_id);
+      if (clip && clip.type !== "caption") {
+        clip.fade_in_secs = cmd.fade_in_secs;
+        clip.fade_out_secs = cmd.fade_out_secs;
+      }
+      break;
+    }
+    case "SetCaption": {
+      const clip = mockFindClip(mockFindTrack(project, cmd.track_id), cmd.clip_id);
+      if (clip && clip.type === "caption") {
+        if (cmd.text != null) clip.text = cmd.text;
+        if (cmd.position_secs != null) clip.position_secs = cmd.position_secs;
+        if (cmd.duration_secs != null) clip.duration_secs = cmd.duration_secs;
+        if (cmd.style_id != null) clip.style_id = cmd.style_id;
+      }
+      break;
+    }
+    case "SetClipMask": {
+      const clip = mockFindClip(mockFindTrack(project, cmd.track_id), cmd.clip_id);
+      if (clip && clip.type !== "caption") clip.mask = cmd.mask;
+      break;
+    }
+    case "MoveClip": {
+      const track = mockFindTrack(project, cmd.track_id);
+      const clip = mockFindClip(track, cmd.clip_id);
+      if (!track || !clip) break;
+      clip.position_secs = cmd.new_position_secs;
+      if (cmd.new_track_id && cmd.new_track_id !== cmd.track_id) {
+        const dest = mockFindTrack(project, cmd.new_track_id);
+        if (dest) {
+          track.clips = track.clips.filter((c) => c.id !== cmd.clip_id);
+          dest.clips.push(clip);
+        }
+      }
+      break;
+    }
+    case "TrimClip": {
+      const clip = mockFindClip(mockFindTrack(project, cmd.track_id), cmd.clip_id);
+      if (clip && clip.type !== "caption") {
+        if (cmd.new_source_in_secs != null) clip.source_in_secs = cmd.new_source_in_secs;
+        if (cmd.new_source_out_secs != null) clip.source_out_secs = cmd.new_source_out_secs;
+      }
+      break;
+    }
+    case "SetProjectSettings": {
+      if (cmd.width != null) project.settings.width = cmd.width;
+      if (cmd.height != null) project.settings.height = cmd.height;
+      if (cmd.fps != null) project.settings.fps = cmd.fps;
+      break;
+    }
+    default:
+      console.warn(`[tauriMock] apply_command: unhandled command "${cmd.command}" — no-op`);
+  }
+}
+
 // ---- Tiny event bus so `listen` actually delivers events (P1 harness upgrade —
 // see docs/preview-webview.md "Harness verification"). Real Tauri's `listen` subscribes
 // to backend-emitted events; here `emit` (below) is the only producer, driven by the
@@ -163,10 +347,16 @@ export function invoke<T = unknown>(cmd: string, args?: any): Promise<T> {
         { path: "C:/proj/recap.renderly.json", name: "tourney recap", durationSecs: 192, modifiedMs: Date.now() - 3.4e8, width: 1920, height: 1080, fps: 30 },
       ]);
     case "get_project":
-      return reply({ project: sampleProject, revision });
+      return reply({ project: currentProject, revision });
     case "open_project":
     case "quick_start_project":
     case "new_project":
+      // Real backend behavior: (re)opening resets session state. Reset the mock's mutable
+      // project back to the pristine sample too, so re-running a harness script against a
+      // freshly "opened" project starts from known state instead of carrying over the
+      // previous script's edits.
+      currentProject = structuredClone(sampleProject);
+      revision = 1;
       return reply("C:/proj/ep12.renderly.json");
     case "list_extensions":
       return reply(extensionCatalog);
@@ -175,10 +365,21 @@ export function invoke<T = unknown>(cmd: string, args?: any): Promise<T> {
         { id: "retro-pack", kind: "pack", summary: "Retro CRT filters and stickers", schema_version: 1, resolved_path: "C:/reg/retro" },
         { id: "denoise-pro", kind: "plugin", summary: "Studio-grade audio denoise", schema_version: 1, resolved_path: "C:/reg/denoise" },
       ]);
-    case "apply_command":
-    case "apply_commands":
+    case "apply_command": {
+      const before = structuredClone(currentProject);
+      applyMockCommand(currentProject, args?.command);
+      const patch = compare(before as unknown as object, currentProject as unknown as object);
       revision += 1;
-      return reply({ revision, patch: [], outcome: "ok", outcomes: ["ok"] });
+      return reply({ revision, patch, outcome: "ok" });
+    }
+    case "apply_commands": {
+      const before = structuredClone(currentProject);
+      const cmds = (args?.commands as unknown[]) ?? [];
+      for (const c of cmds) applyMockCommand(currentProject, c);
+      const patch = compare(before as unknown as object, currentProject as unknown as object);
+      revision += 1;
+      return reply({ revision, patch, outcomes: cmds.map(() => "ok") });
+    }
     case "undo":
     case "redo":
       revision += 1;

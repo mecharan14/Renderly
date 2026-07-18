@@ -116,9 +116,12 @@ export function WebviewPreview({
     }
   }, [playing]);
 
-  // Paused-state scrub (playhead moves without `playing`).
+  // Scrub: paused-state scrub always redraws; a scrub *during* playback is also routed
+  // through here (BUG 3) — `engine.seek()` itself decides whether a jump this size, while
+  // playing, is worth rebasing the local clock for (see its doc comment), so ordinary
+  // tick-driven playhead updates (which stay close to the clock's own prediction) are a
+  // cheap no-op here rather than fighting `onTick`'s smoothing.
   useEffect(() => {
-    if (playing) return;
     engineRef.current?.seek(playhead);
   }, [playhead, playing]);
 

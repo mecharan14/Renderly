@@ -192,6 +192,18 @@ const SEEK_CORRECT_THRESHOLD_SECS = 0.08;
 const PRESEEK_HORIZON_SECS = 0.5;
 const DRIFT_SNAP_THRESHOLD_SECS = 0.25;
 const DRIFT_SLEW_FACTOR = 0.2;
+/// BUG 3 fix: a `seek()` call while playing only rebases the local clock when the target
+/// is at least this far from where the clock already predicts playback to be. Ordinary
+/// backend ticks re-affirm a time close to the local prediction (that's what "the clock is
+/// tracking correctly" means) and must NOT re-trigger a rebase — only `onTick`'s slew
+/// should touch the clock for those. A user scrub produces a large, instantaneous jump,
+/// which is what this threshold is tuned to catch.
+const SEEK_REBASE_THRESHOLD_SECS = 0.15;
+/// After a scrub-during-playback rebase, give the <video> elements this long to actually
+/// seek and settle before `manageElements`' per-frame drift correction resumes hard-seeking
+/// them — without this, the rebase and the immediate next frame's drift correction (video
+/// elements haven't caught up yet) fight each other and produce the reported glitch.
+const SEEK_SETTLE_MS = 200;
 
 export class WebviewPreviewEngine {
   private canvas: HTMLCanvasElement;
@@ -212,6 +224,11 @@ export class WebviewPreviewEngine {
   private clockBaseSecs = 0;
   private clockBasePerf = 0;
   private pausedTimeSecs = 0;
+
+  /// `performance.now()` timestamp before which `manageElements`' per-frame drift
+  /// correction should hold off — set by `seek()` right after a scrub-during-playback
+  /// rebase (see `SEEK_SETTLE_MS`).
+  private suppressDriftUntilPerf = 0;
 
   private rafId: number | null = null;
   /// True when `rafId` was scheduled via `setTimeout` rather than `requestAnimationFrame`
@@ -468,9 +485,28 @@ export class WebviewPreviewEngine {
   /// Paused-state scrub: set the target time, seek any active video (redraw fires on its
   /// 'seeked' event so the paint reflects the actually-decoded frame), and draw
   /// immediately too so a cached/instant seek doesn't wait.
+  ///
+  /// Also handles a scrub *during* playback (BUG 3): previously this early-returned while
+  /// `this.playing` without touching the clock at all, so the local rAF clock kept
+  /// advancing from the pre-scrub position until the next backend `playback:tick` noticed
+  /// a large drift and hard-snapped it (`onTick`) — meanwhile `manageElements` was already
+  /// hard-seeking the stale-drift `<video>` elements every frame, so the stale clock, the
+  /// eventual snap, and the per-frame seeks all fought each other, producing the reported
+  /// glitch. Now a sufficiently large jump (a real scrub, as opposed to an ordinary tick
+  /// re-affirming a time close to the local prediction) rebases the clock immediately and
+  /// briefly suppresses `manageElements`' drift correction so the `<video>` elements can
+  /// seek and settle without being yanked again on the very next frame.
   seek(atSecs: number): void {
     this.pausedTimeSecs = atSecs;
-    if (this.playing) return; // live playback frame will pick this up on its own
+    if (this.playing) {
+      const predicted = this.currentTimeSecs();
+      if (Math.abs(atSecs - predicted) > SEEK_REBASE_THRESHOLD_SECS) {
+        this.clockBaseSecs = atSecs;
+        this.clockBasePerf = performance.now();
+        this.suppressDriftUntilPerf = performance.now() + SEEK_SETTLE_MS;
+      }
+      return; // live playback frame will pick this up on its own
+    }
     this.drawFrame(atSecs);
   }
 
@@ -579,6 +615,10 @@ export class WebviewPreviewEngine {
   private manageElements(project: Project, t: number, active: ActiveLayer[]): void {
     const managed = this.gpu ? [...active, ...transitionIncomingLayers(project, t)] : active;
     const activeIds = new Set(managed.map((l) => l.media.id));
+    // See `seek()`'s doc comment: right after a scrub-during-playback rebase, hold off on
+    // per-frame drift correction for a moment so the just-triggered `<video>` seeks can
+    // land before we re-measure drift against them.
+    const suppressDrift = performance.now() < this.suppressDriftUntilPerf;
 
     // Pre-seek upcoming clips' videos so the cut is gapless.
     for (const upcoming of upcomingLayers(project, t, PRESEEK_HORIZON_SECS)) {
@@ -605,7 +645,7 @@ export class WebviewPreviewEngine {
       const speed = layer.clip.speed && layer.clip.speed > 0 ? layer.clip.speed : 1;
       if (video.playbackRate !== speed) video.playbackRate = speed;
       const drift = Math.abs(video.currentTime - layer.sourceTimeSecs);
-      if (drift > SEEK_CORRECT_THRESHOLD_SECS) {
+      if (!suppressDrift && drift > SEEK_CORRECT_THRESHOLD_SECS) {
         try {
           video.currentTime = layer.sourceTimeSecs;
         } catch {
