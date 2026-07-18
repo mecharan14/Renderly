@@ -619,6 +619,60 @@ fn default_projects_dir() -> Result<PathBuf, String> {
     Ok(PathBuf::from(home).join("Documents").join("Renderly"))
 }
 
+/// `foo.renderly.json` → `Some("foo")`. Mirrors `project_thumb_path`'s stripping (strip the
+/// full `.renderly.json` suffix, not just the last extension — `Path::file_stem` would leave
+/// a trailing `.renderly` on a name like `Jul 18, 2026.renderly.json`).
+fn project_name_stem(file_name: &str) -> Option<&str> {
+    file_name.strip_suffix(".renderly.json")
+}
+
+/// CapCut-style default project name: the current local date, e.g. `Jul 18, 2026`. Windows-
+/// safe (no colons/slashes) since it's comma+space punctuated only.
+fn today_date_label() -> String {
+    chrono::Local::now().format("%b %-d, %Y").to_string()
+}
+
+/// Pure next-free-name logic (B1): given the set of existing project-file name stems (i.e.
+/// `foo.renderly.json` minus the `.renderly.json` suffix, see `project_name_stem`) and
+/// today's date label, pick `date`, or `date (2)`, `date (3)`, … — the first suffix not
+/// already present. Scans sequentially from 2 so it fills gaps (e.g. if `(2)` and `(4)`
+/// exist but `(3)` doesn't, `(3)` is returned) rather than always appending past the max.
+/// Fs-free and side-effect-free so it's unit-testable without touching disk.
+fn next_free_project_name(
+    existing_stems: &std::collections::HashSet<String>,
+    date: &str,
+) -> String {
+    if !existing_stems.contains(date) {
+        return date.to_string();
+    }
+    let mut n = 2u32;
+    loop {
+        let candidate = format!("{date} ({n})");
+        if !existing_stems.contains(&candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// Scan `dir` for `*.renderly.json` files and return their name stems (see
+/// `project_name_stem`). Missing dir reads as "no existing projects" rather than an error —
+/// mirrors `list_projects`' own `!dir.is_dir()` early-return.
+fn existing_project_name_stems(dir: &std::path::Path) -> std::collections::HashSet<String> {
+    let mut stems = std::collections::HashSet::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return stems;
+    };
+    for entry in entries.flatten() {
+        if let Some(name) = entry.file_name().to_str() {
+            if let Some(stem) = project_name_stem(name) {
+                stems.insert(stem.to_string());
+            }
+        }
+    }
+    stems
+}
+
 #[tauri::command]
 async fn quick_start_project(app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
     use renderly_core::project::Settings;
@@ -634,13 +688,11 @@ async fn quick_start_project(app: AppHandle, state: State<'_, AppState>) -> Resu
     ensure_preview_parent(&app, &state)?;
 
     let dir = default_projects_dir()?;
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| e.to_string())?
-        .as_secs();
-    let path_buf = dir.join(format!("Untitled {ts}.renderly.json"));
+    let existing = existing_project_name_stems(&dir);
+    let name = next_free_project_name(&existing, &today_date_label());
+    let path_buf = dir.join(format!("{name}.renderly.json"));
     let project = Project::new(
-        "Untitled edit",
+        name,
         Settings {
             fps: 60.0,
             width: 1080,
@@ -900,7 +952,10 @@ async fn project_thumbnail(path: String) -> Result<Option<String>, String> {
     tauri::async_runtime::spawn_blocking(move || -> Result<Option<String>, String> {
         let path = PathBuf::from(&path);
         let thumb = project_thumb_path(&path);
-        if thumb.is_file() {
+        // Regenerate when missing OR stale (project file mtime newer than the cached thumb)
+        // — a card that's just missing its thumb and one whose project changed since the
+        // last render both need a fresh render; only an up-to-date thumb short-circuits.
+        if thumb_is_fresh(&path, &thumb) {
             return Ok(Some(thumb.to_string_lossy().into_owned()));
         }
         let data = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
@@ -911,9 +966,13 @@ async fn project_thumbnail(path: String) -> Result<Option<String>, String> {
             .round()
             .max(2.0) as u32;
         let w = (w / 2) * 2;
+        // t=0 is frequently black (empty leader / fade-in); sample a representative frame
+        // instead. Falls back to 0.0 for an empty/content-free project, which still renders
+        // (a black frame) rather than erroring — an empty project card should show *something*.
+        let frame_time = renderly_core::perceive::representative_frame_time(&project);
         let png = renderly_core::perceive::render_frame_png(
             &project,
-            0.0,
+            frame_time,
             ExportPreset::Custom {
                 width: w.max(2),
                 height: h,
@@ -926,6 +985,24 @@ async fn project_thumbnail(path: String) -> Result<Option<String>, String> {
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// A cached thumb is fresh iff it exists and its mtime is at least as new as the project
+/// file's. Any I/O failure (either file's metadata/mtime unreadable) is treated as "not
+/// fresh" so callers fall through to regenerating rather than silently keeping a possibly
+/// stale/corrupt cache.
+fn thumb_is_fresh(project_path: &std::path::Path, thumb_path: &std::path::Path) -> bool {
+    let (Ok(project_meta), Ok(thumb_meta)) = (
+        std::fs::metadata(project_path),
+        std::fs::metadata(thumb_path),
+    ) else {
+        return false;
+    };
+    let (Ok(project_mtime), Ok(thumb_mtime)) = (project_meta.modified(), thumb_meta.modified())
+    else {
+        return false;
+    };
+    thumb_mtime >= project_mtime
 }
 
 #[tauri::command]
@@ -1733,5 +1810,62 @@ mod history_tests {
             !patch.0.is_empty(),
             "rename should produce a non-empty JSON Patch"
         );
+    }
+}
+
+#[cfg(test)]
+mod naming_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn stems(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn next_free_project_name_no_collision() {
+        let existing = stems(&["Jul 17, 2026", "Jul 16, 2026"]);
+        assert_eq!(
+            next_free_project_name(&existing, "Jul 18, 2026"),
+            "Jul 18, 2026"
+        );
+    }
+
+    #[test]
+    fn next_free_project_name_single_collision() {
+        let existing = stems(&["Jul 18, 2026"]);
+        assert_eq!(
+            next_free_project_name(&existing, "Jul 18, 2026"),
+            "Jul 18, 2026 (2)"
+        );
+    }
+
+    #[test]
+    fn next_free_project_name_multiple_collisions() {
+        let existing = stems(&["Jul 18, 2026", "Jul 18, 2026 (2)", "Jul 18, 2026 (3)"]);
+        assert_eq!(
+            next_free_project_name(&existing, "Jul 18, 2026"),
+            "Jul 18, 2026 (4)"
+        );
+    }
+
+    #[test]
+    fn next_free_project_name_fills_gap() {
+        // (2) and (4) exist but (3) doesn't — the next free suffix must be the gap, not
+        // one past the highest existing suffix.
+        let existing = stems(&["Jul 18, 2026", "Jul 18, 2026 (2)", "Jul 18, 2026 (4)"]);
+        assert_eq!(
+            next_free_project_name(&existing, "Jul 18, 2026"),
+            "Jul 18, 2026 (3)"
+        );
+    }
+
+    #[test]
+    fn project_name_stem_strips_full_suffix() {
+        assert_eq!(
+            project_name_stem("Jul 18, 2026.renderly.json"),
+            Some("Jul 18, 2026")
+        );
+        assert_eq!(project_name_stem("not-a-project.txt"), None);
     }
 }

@@ -9,7 +9,7 @@ pub use analysis::{
 use crate::commands::ExportPreset;
 use crate::export::{render_frame_at, ExportError, ExportSettings};
 use crate::media::{ffmpeg_available, ffmpeg_path, FfmpegCliError};
-use crate::project::{MediaKind, Project};
+use crate::project::{Clip, MediaKind, Project, TrackKind};
 use image::ImageEncoder;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -54,6 +54,49 @@ pub fn encode_rgba_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, 
         .write_image(rgba, width, height, image::ExtendedColorType::Rgba8)
         .map_err(|e| PerceiveError::PngEncode(e.to_string()))?;
     Ok(png)
+}
+
+/// Pick a representative timeline time for a project thumbnail/gallery card.
+///
+/// `t=0` is frequently black (empty leader, fade-in), so this finds the earliest-starting
+/// enabled video/image clip on a visible video track and samples a bit *into* it —
+/// `min(clip_start + 1.0s, clip_start + clip_duration / 2)` — so short clips still land
+/// inside their own span and longer ones skip past a fade-from-black at the cut. Falls back
+/// to `0.0` for a project with no content clips (an empty project card still renders the
+/// black frame rather than erroring).
+///
+/// Decode-free and pure — reads only clip timing/media-kind, mirrors the "no re-derivation"
+/// rule in this module's doc comment, and is deliberately kept fs/render-free for unit
+/// testing without a real project directory.
+pub fn representative_frame_time(project: &Project) -> f64 {
+    let mut earliest: Option<(f64, f64)> = None; // (start, timeline_duration)
+    for track in &project.tracks {
+        if track.kind != TrackKind::Video || track.hidden {
+            continue;
+        }
+        for clip in &track.clips {
+            let Clip::Video(v) = clip else { continue };
+            if !v.enabled {
+                continue;
+            }
+            let is_content = project
+                .find_media(v.media_id)
+                .map(|m| matches!(m.kind, MediaKind::Video | MediaKind::Image))
+                .unwrap_or(false);
+            if !is_content {
+                continue;
+            }
+            let start = v.position_secs;
+            if earliest.is_none_or(|(cur, _)| start < cur) {
+                earliest = Some((start, v.timeline_duration_secs()));
+            }
+        }
+    }
+    let Some((start, duration)) = earliest else {
+        return 0.0;
+    };
+    let midpoint = start + duration / 2.0;
+    (start + 1.0).min(midpoint).max(start)
 }
 
 /// Render the composited timeline frame at `time_secs` as PNG bytes.
@@ -266,5 +309,73 @@ mod tests {
         let data = r#"{ "transcription": [] }"#;
         let segments = parse_whisper_json(data).unwrap();
         assert!(segments.is_empty());
+    }
+
+    use crate::project::{MediaClip, MediaItem, Settings, Track};
+
+    fn video_media(project: &mut Project, duration_secs: f64) -> uuid::Uuid {
+        let id = uuid::Uuid::new_v4();
+        project.media.push(MediaItem {
+            id,
+            path: PathBuf::from("clip.mp4"),
+            kind: MediaKind::Video,
+            duration_secs: Some(duration_secs),
+            width: Some(1920),
+            height: Some(1080),
+            fps: Some(30.0),
+        });
+        id
+    }
+
+    /// Adds a video track with one enabled clip starting at `position_secs` and spanning
+    /// `duration_secs` of timeline (via a 1x-speed in/out source range), wired to a fresh
+    /// video media item.
+    fn track_with_clip(project: &mut Project, position_secs: f64, duration_secs: f64) {
+        let media_id = video_media(project, position_secs + duration_secs);
+        let mut track = Track::new(TrackKind::Video, "V1");
+        let clip = MediaClip {
+            media_id,
+            position_secs,
+            source_in_secs: 0.0,
+            source_out_secs: duration_secs,
+            ..Default::default()
+        };
+        track.clips.push(Clip::Video(clip));
+        project.tracks.push(track);
+    }
+
+    #[test]
+    fn representative_frame_time_empty_project_is_zero() {
+        let project = Project::new("empty", Settings::default());
+        assert_eq!(representative_frame_time(&project), 0.0);
+    }
+
+    #[test]
+    fn representative_frame_time_samples_a_second_into_first_clip() {
+        let mut project = Project::new("p", Settings::default());
+        track_with_clip(&mut project, 3.0, 10.0);
+        // Inside the clip, 1s past its start — clear of a fade-from-black at the cut.
+        assert!((representative_frame_time(&project) - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn representative_frame_time_short_clip_uses_midpoint() {
+        let mut project = Project::new("p", Settings::default());
+        // 1.5s clip: start + 1.0 would overshoot past the midpoint, so the midpoint wins.
+        track_with_clip(&mut project, 2.0, 1.5);
+        assert!((representative_frame_time(&project) - 2.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn representative_frame_time_ignores_hidden_tracks_and_disabled_clips() {
+        let mut project = Project::new("p", Settings::default());
+        track_with_clip(&mut project, 0.5, 5.0);
+        project.tracks[0].hidden = true;
+        // Second, later, visible track with a disabled clip — should be skipped too.
+        track_with_clip(&mut project, 8.0, 5.0);
+        if let Clip::Video(c) = &mut project.tracks[1].clips[0] {
+            c.enabled = false;
+        }
+        assert_eq!(representative_frame_time(&project), 0.0);
     }
 }

@@ -41,15 +41,23 @@ export function WelcomeScreen() {
     try {
       const list = await ipc.listProjects();
       setProjects(list);
-      // Warm missing thumbs in the background.
+      // `modifiedMs` (the project file's own mtime) doubles as a cache-busting query param:
+      // the underlying thumb PNG is regenerated in place at the same path whenever the
+      // project changes, and the webview's asset-protocol fetch would otherwise cache the
+      // old bytes under that unchanged URL. Keying the query string off the project's own
+      // mtime means the URL only changes when the project (and therefore the thumb) does.
+      const bust = (path: string, ms: number) => `${ipc.assetUrl(path)}?t=${ms}`;
       for (const p of list) {
         if (p.thumbPath) {
-          setThumbs((t) => ({ ...t, [p.path]: ipc.assetUrl(p.thumbPath!) }));
-        } else {
-          void ipc.projectThumbnail(p.path).then((path) => {
-            if (path) setThumbs((t) => ({ ...t, [p.path]: ipc.assetUrl(path) }));
-          });
+          // Show the last-known-good thumb immediately...
+          setThumbs((t) => ({ ...t, [p.path]: bust(p.thumbPath!, p.modifiedMs) }));
         }
+        // ...then always re-check freshness in the background: `project_thumbnail`
+        // regenerates when the project file is newer than the cached thumb (or the thumb
+        // is missing), so a stale `thumbPath` from `list_projects` still gets refreshed.
+        void ipc.projectThumbnail(p.path).then((path) => {
+          if (path) setThumbs((t) => ({ ...t, [p.path]: bust(path, p.modifiedMs) }));
+        });
       }
     } catch (e) {
       toast(`Could not list projects: ${e instanceof Error ? e.message : String(e)}`, "error");
