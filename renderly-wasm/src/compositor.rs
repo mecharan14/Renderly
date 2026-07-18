@@ -17,6 +17,13 @@
 //! skipped by the effect processor), raster/`Generated` mattes (`image::open` — masks of
 //! those kinds are dropped before composite), captions burn-in (P3), and background
 //! removal (needs CPU frame access).
+//!
+//! Same-media transitions (e.g. a split clip with a crossfade at the cut, where both sides
+//! of the transition share one media item): `resolve_layer_source` below resolves the
+//! incoming side's element/texture cache key from `sources["<media_id>#incoming"]` when the
+//! JS engine populates it (see `webviewPreviewEngine.ts`'s `secondaryVideoPool`), falling
+//! back to the plain `"<media_id>"` key otherwise — so different-media transitions are
+//! unaffected.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -58,6 +65,36 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
 fn js_err(context: &str, detail: impl core::fmt::Display) -> JsValue {
     JsValue::from_str(&format!("renderly-wasm: {context}: {detail}"))
+}
+
+/// Resolve which `sources` entry (and which GPU-texture cache key) an `eval::ActiveLayer`
+/// should use.
+///
+/// Same-media transitions: when two clips of a crossfade/wipe/etc reference the SAME media
+/// item (e.g. a split clip), the JS engine cannot key its element pool by media id alone for
+/// both sides — see `webviewPreviewEngine.ts`'s `secondaryVideoPool` doc comment. For that
+/// case it hands the incoming side's `<video>` under `"<media_id>#incoming"` in addition to
+/// the plain `"<media_id>"` key (which keeps tracking the outgoing side). So: for a layer
+/// that IS the incoming side of a transition (`transition.is_incoming == true`), try the
+/// `#incoming` key first and fall back to the plain key when absent — different-media
+/// transitions never populate `#incoming`, so they resolve the plain key unchanged, with
+/// zero JS-side cost. The returned key is also used to cache/key the GPU texture
+/// (`ensure_media_texture`/`media_textures`) so the two sides of a same-media transition get
+/// distinct textures instead of one clobbering the other.
+fn resolve_layer_source(layer: &eval::ActiveLayer, sources: &js_sys::Object) -> (String, JsValue) {
+    let media_id_key = layer.media_id.to_string();
+    let is_incoming = layer.transition.map(|t| t.is_incoming).unwrap_or(false);
+    if is_incoming {
+        let incoming_key = format!("{media_id_key}#incoming");
+        let incoming_el = js_sys::Reflect::get(sources, &JsValue::from_str(&incoming_key))
+            .unwrap_or(JsValue::UNDEFINED);
+        if !incoming_el.is_undefined() && !incoming_el.is_null() {
+            return (incoming_key, incoming_el);
+        }
+    }
+    let element = js_sys::Reflect::get(sources, &JsValue::from_str(&media_id_key))
+        .unwrap_or(JsValue::UNDEFINED);
+    (media_id_key, element)
 }
 
 struct MediaTexture {
@@ -259,9 +296,7 @@ impl WasmCompositor {
 
         let mut compose_layers: Vec<ComposeLayer> = Vec::with_capacity(layers.len());
         for layer in &layers {
-            let key = layer.media_id.to_string();
-            let element = js_sys::Reflect::get(sources, &JsValue::from_str(&key))
-                .unwrap_or(JsValue::UNDEFINED);
+            let (key, element) = resolve_layer_source(layer, sources);
             if element.is_undefined() || element.is_null() {
                 continue;
             }
@@ -365,17 +400,17 @@ impl WasmCompositor {
             Ok(layers) => {
                 let mut out = String::new();
                 for layer in &layers {
-                    let key = layer.media_id.to_string();
-                    let element = js_sys::Reflect::get(sources, &JsValue::from_str(&key))
-                        .unwrap_or(JsValue::UNDEFINED);
+                    let media_id_str = layer.media_id.to_string();
+                    let (key, element) = resolve_layer_source(layer, sources);
                     let found = !element.is_undefined() && !element.is_null();
                     let ready = element
                         .dyn_ref::<HtmlVideoElement>()
                         .map(|v| v.ready_state())
                         .unwrap_or(99);
                     out.push_str(&format!(
-                        "[media={} found={found} ready={ready} transition={:?} opacity={}] ",
-                        &key[key.len() - 4..],
+                        "[media={} resolved_key={} found={found} ready={ready} transition={:?} opacity={}] ",
+                        &media_id_str[media_id_str.len() - 4..],
+                        key,
                         layer
                             .transition
                             .map(|t| (t.kind.as_str(), t.progress, t.is_incoming)),

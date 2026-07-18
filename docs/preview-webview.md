@@ -330,9 +330,17 @@ media file ──► <video> / WebCodecs VideoDecoder (HW decode, browser-schedu
   - Captions burn-in (P3 per the phase plan), audio (stays on the backend/rodio path).
   - Images in the harness: the sample logo isn't mapped to a real file by the mock, so the
     `HTMLImageElement` code path in `render` is written but not pixel-verified.
-  - Same-media transitions: both sides of a transition between two clips of the SAME
-    media item share one `<video>` element, so both sample the same frame during the
-    window (native opens a second decoder; a second pooled element is future work).
+  - ~~Same-media transitions~~ — FIXED (2026-07-18): both sides of a transition between two
+    clips of the SAME media item used to share one `<video>` element, so `manageElements`
+    drift-corrected it to two different source times every frame (seek thrash), its
+    `seeking`/`readyState` gate never settled, and `compositor.rs::render` dropped the layer
+    on both sides — a black transition window. Now the JS engine lazily allocates a second
+    pooled `<video>` (`secondaryVideoPool`) for the incoming side whenever it detects the
+    same-media collision, keyed into `render(t, sources)`'s `sources` object as
+    `"<media_id>#incoming"`; `compositor.rs`'s `resolve_layer_source` tries that key first
+    for the incoming side of a transition and falls back to the plain media-id key, so
+    different-media transitions are unaffected. Regression covered by the harness sample
+    project's `c-round1a`/`c-round1b` split-clip crossfade (same `m-round1` media).
   - Production (`vite build`) bundles do NOT include the wasm pkg (the dynamic import
     specifier is invisible to the bundler on purpose, so builds stay green with the
     gitignored pkg absent — verified both with and without the pkg on disk). Dev mode

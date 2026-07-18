@@ -71,6 +71,12 @@ type ActiveLayer = {
   clip: MediaClip;
   media: MediaItem;
   sourceTimeSecs: number;
+  /// True when this layer must be tracked on the SECONDARY pooled element for its media id
+  /// (see `secondaryVideoPool`) rather than the primary one — set for a transition-incoming
+  /// layer whose media id collides with the outgoing side's media id (a same-media split-
+  /// clip transition), where both sides would otherwise fight over one `<video>` element's
+  /// `currentTime` every frame. See `transitionPairFor`/`transitionIncomingLayers`.
+  useSecondary?: boolean;
 };
 
 /// Mirrors `active_layers` in renderly-core/src/export/mod.rs: iterate tracks in array
@@ -100,10 +106,15 @@ function activeLayersAt(project: Project, t: number): ActiveLayer[] {
 }
 
 /// If `clip` is the INCOMING side of some other clip's `outgoing_transition` on the same
-/// track (same adjacency test as `transitionIncomingLayers`/eval.rs), returns the transition
-/// window's start time (`cut - duration`). Used so pre-seeking anchors on when the blend
-/// window opens rather than the cut point itself — see `upcomingLayers`.
-function transitionWindowStartFor(track: Track, clip: MediaClip): number | null {
+/// track (same adjacency test as `transitionIncomingLayers`/eval.rs), returns the outgoing
+/// clip and the transition window's start time (`cut - duration`). Used so pre-seeking
+/// anchors on when the blend window opens rather than the cut point itself (see
+/// `upcomingLayers`), and so callers can tell whether the pair shares one media item (a
+/// same-media split-clip transition — see `useSecondary` on `ActiveLayer`).
+function transitionPairFor(
+  track: Track,
+  clip: MediaClip,
+): { outgoing: MediaClip; windowStart: number } | null {
   const clips = (track.clips as Clip[])
     .filter((c): c is MediaClip => c.type === "video" && c.enabled)
     .sort((a, b) => a.position_secs - b.position_secs);
@@ -117,7 +128,7 @@ function transitionWindowStartFor(track: Track, clip: MediaClip): number | null 
     if (Math.abs(incoming.position_secs - end) > 0.05 && incoming.position_secs < end - 1e-6) {
       continue;
     }
-    return end - tr.duration_secs;
+    return { outgoing: v, windowStart: end - tr.duration_secs };
   }
   return null;
 }
@@ -139,21 +150,30 @@ function upcomingLayers(project: Project, t: number, horizonSecs: number): Activ
     if (track.kind !== "video" || track.hidden) continue;
     let best: MediaClip | null = null;
     let bestAnchor = Infinity;
+    let bestUseSecondary = false;
     for (const clip of track.clips as Clip[]) {
       if (clip.type !== "video" || !clip.enabled) continue;
-      const anchor = transitionWindowStartFor(track, clip) ?? clip.position_secs;
+      const pair = transitionPairFor(track, clip);
+      const anchor = pair?.windowStart ?? clip.position_secs;
       const startsIn = anchor - t;
       if (startsIn > 0 && startsIn <= horizonSecs) {
         if (!best || anchor < bestAnchor) {
           best = clip;
           bestAnchor = anchor;
+          bestUseSecondary = pair != null && pair.outgoing.media_id === clip.media_id;
         }
       }
     }
     if (!best) continue;
     const media = project.media.find((m) => m.id === best!.media_id);
     if (!media) continue;
-    layers.push({ trackId: track.id, clip: best, media, sourceTimeSecs: best.source_in_secs });
+    layers.push({
+      trackId: track.id,
+      clip: best,
+      media,
+      sourceTimeSecs: best.source_in_secs,
+      useSecondary: bestUseSecondary,
+    });
   }
   return layers;
 }
@@ -164,10 +184,14 @@ function upcomingLayers(project: Project, t: number, horizonSecs: number): Activ
 /// separately — this mirrors eval.rs's window math for ELEMENT MANAGEMENT ONLY (which
 /// <video> to play/seek); the compositing decision itself stays in Rust.
 ///
-/// Known limitation: when both sides of a transition reference the SAME media item (e.g. a
-/// split clip), they share one <video> element, so both sides sample the same frame during
-/// the window (the native path opens a second decoder; a second pooled element per
-/// media×window is future work).
+/// Same-media transitions (e.g. a split clip with a crossfade at the cut): when the outgoing
+/// and incoming clips reference the SAME media item, `useSecondary` is set so the caller
+/// tracks the incoming side on a second pooled `<video>` element (see `secondaryVideoPool`)
+/// instead of sharing the primary one with the outgoing side — otherwise both sides drift-
+/// correct the single shared element to two different source times every frame (seek
+/// thrash), its `seeking`/`readyState` gate never settles, and the compositor drops the
+/// layer on both sides (a black window). The Rust side resolves the same-keyed
+/// `"<media_id>#incoming"` source when present (renderly-wasm/src/compositor.rs).
 function transitionIncomingLayers(project: Project, t: number): ActiveLayer[] {
   const layers: ActiveLayer[] = [];
   for (const track of project.tracks) {
@@ -195,6 +219,7 @@ function transitionIncomingLayers(project: Project, t: number): ActiveLayer[] {
         clip: incoming,
         media,
         sourceTimeSecs: incoming.source_in_secs + (t - windowStart) * speed,
+        useSecondary: v.media_id === incoming.media_id,
       });
       break;
     }
@@ -241,6 +266,13 @@ const SEEK_REBASE_THRESHOLD_SECS = 0.15;
 /// them — without this, the rebase and the immediate next frame's drift correction (video
 /// elements haven't caught up yet) fight each other and produce the reported glitch.
 const SEEK_SETTLE_MS = 200;
+/// How long (in `performance.now()` ms) a secondary transition-incoming `<video>` element
+/// (see `secondaryVideoPool`) is kept alive after it was last needed by
+/// `transitionIncomingLayers`/`upcomingLayers` before being torn down. Same-media
+/// transitions are typically short (well under a second), so without this grace window a
+/// re-entering scrub or a slightly-early/late frame would tear down and immediately
+/// recreate the element, forcing a fresh decode each time.
+const SECONDARY_TEARDOWN_GRACE_MS = 2000;
 
 export class WebviewPreviewEngine {
   private canvas: HTMLCanvasElement;
@@ -261,6 +293,20 @@ export class WebviewPreviewEngine {
   /// seek to actually finish, so a paused scrub composited whatever the mid-seek element
   /// had (often nothing → black) and never redrew once the decoded frame landed.
   private videoListenerCleanup = new Map<string, () => void>();
+
+  /// Secondary pooled `<video>` elements, keyed by media id, used ONLY for a transition-
+  /// incoming layer whose media id collides with the outgoing side's (a same-media split-
+  /// clip transition — see `ActiveLayer.useSecondary`). Created lazily on first collision,
+  /// never for ordinary (different-media) transitions or non-transition playback, so most
+  /// media items never get a second element. Keyed into `gpu.render`'s `sources` object as
+  /// `"<media_id>#incoming"` (renderly-wasm/src/compositor.rs resolves that key first for
+  /// the incoming side of a transition, falling back to the plain media-id key).
+  private secondaryVideoPool = new Map<string, HTMLVideoElement>();
+  private secondaryListenerCleanup = new Map<string, () => void>();
+  /// `performance.now()` timestamp each secondary element was last part of the managed set
+  /// (active this frame or within the pre-seek horizon) — drives `SECONDARY_TEARDOWN_GRACE_MS`
+  /// teardown in `manageElements`.
+  private secondaryLastNeededPerf = new Map<string, number>();
 
   private playing = false;
   private clockBaseSecs = 0;
@@ -478,6 +524,53 @@ export class WebviewPreviewEngine {
     for (const id of this.imgPool.keys()) {
       if (!wanted.has(id)) this.imgPool.delete(id);
     }
+    for (const id of Array.from(this.secondaryVideoPool.keys())) {
+      if (!wanted.has(id)) this.teardownSecondaryVideo(id);
+    }
+  }
+
+  /// Lazily create (or return the existing) secondary pooled `<video>` element for
+  /// `mediaId` — see `secondaryVideoPool`'s doc comment. Mirrors the primary pool's element
+  /// setup in `reconcileMediaElements` (muted/hidden/appended, same 'seeked'/'loadeddata'
+  /// redraw wiring) so it behaves identically from the readiness-gate/drift-correction
+  /// caller's point of view.
+  private ensureSecondaryVideo(mediaId: string, media: MediaItem): HTMLVideoElement {
+    const existing = this.secondaryVideoPool.get(mediaId);
+    if (existing) return existing;
+    const el = document.createElement("video");
+    el.muted = true;
+    el.preload = "auto";
+    el.playsInline = true;
+    el.crossOrigin = "anonymous";
+    el.src = this.assetUrl(media.path);
+    el.style.display = "none";
+    document.body.appendChild(el);
+    this.secondaryVideoPool.set(mediaId, el);
+    const onReady = () => {
+      if (this.disposed || this.playing) return;
+      this.drawFrame(this.pausedTimeSecs);
+    };
+    el.addEventListener("seeked", onReady);
+    el.addEventListener("loadeddata", onReady);
+    this.secondaryListenerCleanup.set(mediaId, () => {
+      el.removeEventListener("seeked", onReady);
+      el.removeEventListener("loadeddata", onReady);
+    });
+    return el;
+  }
+
+  private teardownSecondaryVideo(mediaId: string): void {
+    this.secondaryListenerCleanup.get(mediaId)?.();
+    this.secondaryListenerCleanup.delete(mediaId);
+    const el = this.secondaryVideoPool.get(mediaId);
+    if (el) {
+      el.pause();
+      el.removeAttribute("src");
+      el.load();
+      el.remove();
+    }
+    this.secondaryVideoPool.delete(mediaId);
+    this.secondaryLastNeededPerf.delete(mediaId);
   }
 
   private currentTimeSecs(): number {
@@ -618,6 +711,10 @@ export class WebviewPreviewEngine {
       // decided on the JS side in this mode; `active` above only drove element readiness.
       const sources: Record<string, HTMLVideoElement | HTMLImageElement> = {};
       for (const [id, video] of this.videoPool) sources[id] = video;
+      // Same-media transition-incoming elements, keyed distinctly so the Rust side gets a
+      // second GPU texture instead of clobbering the outgoing side's — see
+      // `secondaryVideoPool`'s doc comment and compositor.rs's `render`.
+      for (const [id, video] of this.secondaryVideoPool) sources[`${id}#incoming`] = video;
       for (const [id, img] of this.imgPool) sources[id] = img;
       try {
         this.gpu.render(t, sources);
@@ -709,20 +806,52 @@ export class WebviewPreviewEngine {
   /// skip compositing rather than presenting a black/stale frame while a paused scrub's seek
   /// is still in flight.
   private manageElements(project: Project, t: number, active: ActiveLayer[]): boolean {
-    const managed = this.gpu ? [...active, ...transitionIncomingLayers(project, t)] : active;
+    const incoming = this.gpu ? transitionIncomingLayers(project, t) : [];
+    const managed = this.gpu ? [...active, ...incoming] : active;
+    const upcoming = upcomingLayers(project, t, PRESEEK_HORIZON_SECS);
+    // Pausing/activeness bookkeeping below is keyed by media id (not element identity): an
+    // outgoing layer and a colliding same-media incoming layer share a media id, so this set
+    // still correctly keeps the PRIMARY element unpaused for both — only the incoming side
+    // is redirected onto the secondary element (see `useSecondary` below).
     const activeIds = new Set(managed.map((l) => l.media.id));
     // See `seek()`'s doc comment: right after a scrub-during-playback rebase, hold off on
     // per-frame drift correction for a moment so the just-triggered `<video>` seeks can
     // land before we re-measure drift against them.
     const suppressDrift = performance.now() < this.suppressDriftUntilPerf;
+    const now = performance.now();
+
+    // Track which secondary elements are needed this frame (active transition-incoming) or
+    // within the pre-seek horizon, and tear down any others that have been idle past the
+    // grace window (see `SECONDARY_TEARDOWN_GRACE_MS`).
+    const neededSecondary = new Set<string>();
+    for (const l of incoming) if (l.useSecondary) neededSecondary.add(l.media.id);
+    for (const l of upcoming) if (l.useSecondary) neededSecondary.add(l.media.id);
+    for (const id of neededSecondary) this.secondaryLastNeededPerf.set(id, now);
+    for (const id of Array.from(this.secondaryVideoPool.keys())) {
+      if (neededSecondary.has(id)) continue;
+      const lastNeeded = this.secondaryLastNeededPerf.get(id) ?? 0;
+      if (now - lastNeeded > SECONDARY_TEARDOWN_GRACE_MS) this.teardownSecondaryVideo(id);
+    }
 
     // Pre-seek upcoming clips' videos so the cut is gapless.
-    for (const upcoming of upcomingLayers(project, t, PRESEEK_HORIZON_SECS)) {
-      const video = this.videoPool.get(upcoming.media.id);
-      if (!video || activeIds.has(upcoming.media.id)) continue;
-      if (Math.abs(video.currentTime - upcoming.sourceTimeSecs) > SEEK_CORRECT_THRESHOLD_SECS) {
+    for (const upcomingLayer of upcoming) {
+      if (upcomingLayer.useSecondary) {
+        const video = this.ensureSecondaryVideo(upcomingLayer.media.id, upcomingLayer.media);
+        if (Math.abs(video.currentTime - upcomingLayer.sourceTimeSecs) > SEEK_CORRECT_THRESHOLD_SECS) {
+          try {
+            video.currentTime = upcomingLayer.sourceTimeSecs;
+            if (!this.playing) this.scheduleVideoFrameCallback(video);
+          } catch {
+            /* not seekable yet (metadata not loaded) — next frame will retry */
+          }
+        }
+        continue;
+      }
+      const video = this.videoPool.get(upcomingLayer.media.id);
+      if (!video || activeIds.has(upcomingLayer.media.id)) continue;
+      if (Math.abs(video.currentTime - upcomingLayer.sourceTimeSecs) > SEEK_CORRECT_THRESHOLD_SECS) {
         try {
-          video.currentTime = upcoming.sourceTimeSecs;
+          video.currentTime = upcomingLayer.sourceTimeSecs;
           if (!this.playing) this.scheduleVideoFrameCallback(video);
         } catch {
           /* not seekable yet (metadata not loaded) — next frame will retry */
@@ -734,11 +863,20 @@ export class WebviewPreviewEngine {
     for (const [id, video] of this.videoPool) {
       if (!activeIds.has(id) && !video.paused) video.pause();
     }
+    // Same for secondary elements no longer needed at all (not even within the pre-seek
+    // horizon) — they were torn down above, but one still mid-grace-window should also pause
+    // once it's no longer this frame's active incoming layer.
+    for (const [id, video] of this.secondaryVideoPool) {
+      const isActiveIncoming = incoming.some((l) => l.useSecondary && l.media.id === id);
+      if (!isActiveIncoming && !video.paused) video.pause();
+    }
 
     let allReady = true;
     for (const layer of managed) {
       if (layer.media.kind !== "video") continue;
-      const video = this.videoPool.get(layer.media.id);
+      const video = layer.useSecondary
+        ? this.ensureSecondaryVideo(layer.media.id, layer.media)
+        : this.videoPool.get(layer.media.id);
       if (!video || video.readyState < 2) {
         allReady = false;
         continue;
@@ -811,6 +949,7 @@ export class WebviewPreviewEngine {
       v.remove();
     }
     this.videoPool.clear();
+    for (const id of Array.from(this.secondaryVideoPool.keys())) this.teardownSecondaryVideo(id);
     this.imgPool.clear();
   }
 }

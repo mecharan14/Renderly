@@ -33,6 +33,13 @@ export const MOCK_IDS = {
   "c-cap2": "cccccccc-0000-4000-8000-000000000008",
   "c-cap3": "cccccccc-0000-4000-8000-000000000009",
   "e1": "eeeeeeee-0000-4000-8000-000000000001",
+  // Same-media split-clip crossfade regression (previously untestable — see
+  // docs/preview-webview.md "Same-media transitions"): two adjacent clips that BOTH
+  // reference m-round1 (the common "split a clip, crossfade the cut" case), on their own
+  // track so they never overlap the existing t-v1/t-v2 content in time.
+  "t-v3": "bbbbbbbb-0000-4000-8000-000000000005",
+  "c-round1a": "cccccccc-0000-4000-8000-00000000000a",
+  "c-round1b": "cccccccc-0000-4000-8000-00000000000b",
 } as const;
 
 const sampleProject: Project = {
@@ -74,6 +81,22 @@ const sampleProject: Project = {
       clips: [
         { type: "audio", id: MOCK_IDS["c-vo"], media_id: MOCK_IDS["m-vo"], position_secs: 2.5, source_in_secs: 0, source_out_secs: 18, gain_db: 0, enabled: true, fade_in_secs: 0.2, fade_out_secs: 0.4 },
         { type: "audio", id: MOCK_IDS["c-bgm"], media_id: MOCK_IDS["m-bgm"], position_secs: 22, source_in_secs: 0, source_out_secs: 12, gain_db: -12, enabled: true, fade_in_secs: 0, fade_out_secs: 1 },
+      ],
+    },
+    {
+      // Same-media split-clip crossfade: c-round1a/c-round1b both reference m-round1 (BUG
+      // regression case — the pre-fix element pool keyed by media id shared ONE <video> for
+      // both sides, so `manageElements` drift-corrected it toward two different source
+      // times every frame and the transition window rendered black; see
+      // docs/preview-webview.md "Same-media transitions"). Window is [45.0, 45.5).
+      id: MOCK_IDS["t-v3"], kind: "video", name: "Split Clip Test", muted: false, locked: false, hidden: false,
+      clips: [
+        { type: "video", id: MOCK_IDS["c-round1a"], media_id: MOCK_IDS["m-round1"], position_secs: 40, source_in_secs: 0, source_out_secs: 5.5, gain_db: 0, enabled: true, fade_in_secs: 0, fade_out_secs: 0, outgoing_transition: { kind: "crossfade", duration_secs: 0.5 } },
+        // source_in deliberately far from the outgoing side's 0..5.5 range so the two
+        // sides sample visibly different frames of m-round1 during the blend window —
+        // makes a genuine crossfade distinguishable from "both sides show the same frame"
+        // (the pre-fix symptom) when pixel-sampled.
+        { type: "video", id: MOCK_IDS["c-round1b"], media_id: MOCK_IDS["m-round1"], position_secs: 45.5, source_in_secs: 8.0, source_out_secs: 11.0, gain_db: 0, enabled: true, fade_in_secs: 0, fade_out_secs: 0 },
       ],
     },
     {
