@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type RefObject } from "react";
 import { Film, Music, Type, VolumeX, Lock, EyeOff, MoreHorizontal } from "lucide-react";
 import { useEditorStore } from "../../store/editorStore";
 import { deleteTrack, renameTrack, setTrackFlags } from "../../lib/commands";
-import { trackLayout, TRACK_LABEL_W } from "../../timeline/layout";
+import { displayOrder, trackLayout, TRACK_LABEL_W } from "../../timeline/layout";
 import type { Track } from "../../lib/types";
 import { Tooltip } from "../ui/Tooltip";
 
@@ -54,7 +54,10 @@ export function TrackHeaders({ containerRef }: { containerRef: RefObject<HTMLEle
   const scrollY = useEditorStore((s) => s.scrollY);
   if (!project || project.tracks.length === 0 || height === 0) return null;
 
-  const { trackH, laneTop } = trackLayout(height, project.tracks.length, scrollY);
+  // Same visual row order as the canvas (renderer.ts/interactions.ts) — see
+  // `timeline/layout.ts`'s `displayOrder` doc comment for the CapCut-style mapping.
+  const order = displayOrder(project);
+  const { trackH, laneTop } = trackLayout(height, order.length, scrollY);
 
   function startRename(track: Track) {
     explicitRenameActionRef.current = false;
@@ -83,7 +86,7 @@ export function TrackHeaders({ containerRef }: { containerRef: RefObject<HTMLEle
 
   return (
     <div className="track-headers" style={{ width: TRACK_LABEL_W }} ref={rootRef}>
-      {project.tracks.map((track, i) => (
+      {order.map(({ track }, i) => (
         <div
           key={track.id}
           className={`track-header-row kind-${track.kind}`}

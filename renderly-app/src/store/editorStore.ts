@@ -102,11 +102,17 @@ export interface DragGhost {
   kind: MediaKind;
   durationSecs: number;
   positionSecs: number;
-  /// Index into `project.tracks`, or `project.tracks.length` for "drop below the last
-  /// track" — the cue to auto-create a new track (see `layout.trackIndexAtY`).
-  trackIndex: number;
-  /// Whether `trackIndex` is a real, kind-compatible drop target — drives ghost color
-  /// (valid vs. invalid) the same way CapCut shows a red ghost over an incompatible track.
+  /// Index into `project.tracks` to drop into, or `null` to auto-create a new track (drop
+  /// above the topmost overlay lane or below the bottommost lane — see
+  /// `layout.dropTargetAtY`).
+  trackIndex: number | null;
+  /// Visual row to render the ghost at — `-1` for "new track above everything", the
+  /// display row count for "new track below everything", otherwise a real row index. See
+  /// `layout.dropTargetAtY`.
+  row: number;
+  /// Whether `trackIndex`/`row` is a real, kind-compatible drop target — drives ghost
+  /// color (valid vs. invalid) the same way CapCut shows a red ghost over an incompatible
+  /// track.
   valid: boolean;
 }
 
@@ -444,7 +450,8 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     if (!project || !dragGhost || !dragGhost.valid) return;
 
     const trackKind: TrackKind = dragGhost.kind === "audio" ? "audio" : "video";
-    const existingTrack = project.tracks[dragGhost.trackIndex] as Track | undefined;
+    const existingTrack =
+      dragGhost.trackIndex != null ? (project.tracks[dragGhost.trackIndex] as Track | undefined) : undefined;
 
     if (existingTrack) {
       await get().dispatch(
@@ -453,11 +460,16 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       return;
     }
 
-    // Dropped below the last track — CapCut-style auto-track: AddTrack + AddClip as one
-    // atomic batch, so undo removes both together instead of leaving an empty track. The
-    // new track's id is generated here (not server-side) so the AddClip in the SAME
-    // batch can reference it — apply_commands has no way to thread one command's
-    // server-generated output into a later command in the same call.
+    // Dropped above the topmost overlay lane or below the bottommost lane — CapCut-style
+    // auto-track: AddTrack + AddClip as one atomic batch, so undo removes both together
+    // instead of leaving an empty track. `AddTrack` always appends to the END of
+    // `project.tracks`, which (per `layout.displayOrder`'s documented mapping) lands a new
+    // video/image track at the visual TOP of the overlay group and a new audio track at
+    // the visual BOTTOM of the audio group — i.e. always right where the user dropped it,
+    // regardless of which edge triggered the auto-create. The new track's id is generated
+    // here (not server-side) so the AddClip in the SAME batch can reference it —
+    // apply_commands has no way to thread one command's server-generated output into a
+    // later command in the same call.
     const trackName =
       trackKind === "video" ? `Video ${project.tracks.length + 1}` : `Audio ${project.tracks.length + 1}`;
     const newTrackId = crypto.randomUUID();

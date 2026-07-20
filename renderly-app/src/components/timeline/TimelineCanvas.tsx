@@ -5,7 +5,7 @@ import { useTimelineInteractions } from "../../timeline/interactions";
 import { readMediaDrag } from "../../lib/dragMedia";
 import { readTransitionDrag, transitionFromPayload } from "../../lib/dragTransition";
 import { setClipTransition } from "../../lib/commands";
-import { hitTestClip, hitTestTransitionJunction, secsFromCanvasX, trackIndexAtY } from "../../timeline/layout";
+import { dropTargetAtY, hitTestClip, hitTestTransitionJunction, secsFromCanvasX } from "../../timeline/layout";
 import { snapTime } from "../../timeline/snap";
 
 function currentRenderState() {
@@ -154,8 +154,8 @@ export function TimelineCanvas() {
           const y = e.clientY - rect.top;
           const rawSecs = secsFromCanvasX(x, pxPerSec, scrollX);
           const positionSecs = snapTime(rawSecs, project, playhead, pxPerSec, snapEnabled);
-          const trackIndex = trackIndexAtY(rect.height, project.tracks.length, y, scrollY);
-          const targetTrack = project.tracks[trackIndex];
+          const target = dropTargetAtY(project, rect.height, y, scrollY);
+          const targetTrack = target.trackIndex != null ? project.tracks[target.trackIndex] : undefined;
           const wantsKind = payload.kind === "audio" ? "audio" : "video";
           // Locked tracks are GUI-honored only (core deliberately still accepts the
           // resulting AddClip — see `Track::locked`'s doc comment) — the ghost must flag
@@ -169,7 +169,8 @@ export function TimelineCanvas() {
             kind: payload.kind,
             durationSecs: payload.durationSecs,
             positionSecs,
-            trackIndex,
+            trackIndex: target.trackIndex,
+            row: target.row,
             valid,
           });
         }}

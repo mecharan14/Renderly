@@ -1909,8 +1909,13 @@ input[type="range"]:disabled {
 
 /* —— Track headers (DOM overlay on the canvas's TRACK_LABEL_W gutter) —— */
 .track-headers {
+  /* top: 0, not var(--ruler-h) — trackLayout()'s laneTop() (timeline/layout.ts) already
+     bakes RULER_H into each row's own `top` inline style (shared with renderer.ts/
+     interactions.ts lane math), since both the canvas and this container are absolutely
+     positioned at the same (0,0) origin within .timeline-canvas-wrap. Adding RULER_H here
+     too double-counted it, pushing every header row RULER_H (24px) below its canvas lane. */
   position: absolute;
-  top: var(--ruler-h);
+  top: 0;
   left: 0;
   bottom: 0;
   pointer-events: none;

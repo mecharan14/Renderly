@@ -7,12 +7,12 @@ import { deleteClip, moveClip, setCaption, splitClip, trimClip } from "../lib/co
 import type { Clip, Project } from "../lib/types";
 import { useEditorStore } from "../store/editorStore";
 import {
+  dropTargetAtY,
   hitTestClip,
   hitTestTransitionJunction,
   RULER_H,
   TRACK_LABEL_W,
   secsFromCanvasX,
-  trackIndexAtY,
 } from "./layout";
 import { snapTime } from "./snap";
 
@@ -382,8 +382,13 @@ export function useTimelineInteractions(canvasRef: RefObject<HTMLCanvasElement |
           }
           nextProject = next;
         } else {
-          const destIndex = trackIndexAtY(rect.height, project.tracks.length, y, store.scrollY);
-          const destTrack = project.tracks[destIndex];
+          // Plain clip-drag never auto-creates a track (only media-panel drops do, via
+          // `dropMediaOnTimeline`) — `dropTargetAtY` returning `trackIndex: null` (drag
+          // above the top lane or below the bottom lane) correctly falls through to
+          // `destTrack` being `undefined` below, same as it did before this used the
+          // CapCut display-order mapping.
+          const destTrackIndex = dropTargetAtY(project, rect.height, y, store.scrollY).trackIndex;
+          const destTrack = destTrackIndex != null ? project.tracks[destTrackIndex] : undefined;
           const srcTrack = project.tracks.find((t) => t.id === drag.currentTrackId);
           const canCrossMove =
             destTrack &&

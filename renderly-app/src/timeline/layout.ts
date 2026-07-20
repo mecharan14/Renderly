@@ -68,21 +68,80 @@ export function trackLayout(_viewportH: number, _trackCount: number, scrollY = 0
   };
 }
 
-/// Which track lane `y` falls in, for drag-and-drop targeting. Returns an index in
-/// `[0, trackCount)` for an existing lane, or `trackCount` itself if `y` is below every
-/// existing track — the caller's cue to auto-create a new track (CapCut-style drop below
-/// the timeline).
-export function trackIndexAtY(
+export interface DisplayTrack {
+  /** Index into `project.tracks` — the array the compositor reads bottom→top. */
+  trackIndex: number;
+  track: Track;
+}
+
+/// CapCut-style visual mapping (issue 2). `project.tracks` is the core's compositing
+/// order — array position = bottom→top, the LAST track composites on top (see
+/// AGENTS.md §0.2 / docs/architecture.md) — but that is the OPPOSITE of how every
+/// mainstream editor displays a timeline (topmost overlay lane visually on top). This is
+/// the ONE place that reconciles the two: video/caption ("overlay") tracks are shown in
+/// REVERSE array order, so the last-in-array track (the topmost compositing layer) is
+/// visual row 0. Audio tracks have no z-order in the compositor — they're mixed, not
+/// stacked — so they're kept in natural array order beneath the overlay group: since
+/// `AddTrack` always appends, a newly created audio track lands at the BOTTOM of the
+/// audio zone, i.e. exactly where a user dropping audio there expects the new lane to
+/// appear (documented choice — see `dropTargetAtY`, which relies on this for its
+/// "append-only" new-track semantics to land in the right visual spot for both zones).
+///
+/// EVERY piece of code that gives `project.tracks` a visual row meaning — renderer lane
+/// drawing, hit-testing, drag/trim interactions, junction/transition badges, TrackHeaders
+/// row order, drop-target math, scrollbar content — MUST iterate this (or its inverse
+/// `rowForTrackIndex`) instead of indexing `project.tracks` positionally.
+export function displayOrder(project: Project): DisplayTrack[] {
+  const overlay: DisplayTrack[] = [];
+  const audio: DisplayTrack[] = [];
+  project.tracks.forEach((track, trackIndex) => {
+    (track.kind === "audio" ? audio : overlay).push({ trackIndex, track });
+  });
+  overlay.reverse();
+  return [...overlay, ...audio];
+}
+
+/// Inverse of `displayOrder`: `project.tracks` index -> visual row index, or -1 if the
+/// track isn't found. O(track count) — timeline track counts are small enough this is
+/// fine to call per-lookup rather than caching.
+export function rowForTrackIndex(project: Project, trackIndex: number): number {
+  return displayOrder(project).findIndex((d) => d.trackIndex === trackIndex);
+}
+
+export interface RowDropTarget {
+  /** `project.tracks` index of an existing lane to drop into, or `null` to auto-create a
+   *  new track (CapCut-style drop above the overlay group / below the audio group). */
+  trackIndex: number | null;
+  /** Visual row to render the ghost/insertion-line at: a real row index for an existing
+   *  target, `-1` for "new track above everything", or the display row count for "new
+   *  track below everything". */
+  row: number;
+}
+
+/// Which visual row `y` falls in, resolved all the way to a `project.tracks` index via
+/// `displayOrder` — the single source of truth for both drag-and-drop targeting
+/// (editorStore.dropMediaOnTimeline / TimelineCanvas's drag-ghost preview) and cross-track
+/// clip moves (interactions.ts). `y` above the topmost lane signals "new overlay track on
+/// top" (CapCut's drop-above-the-top-lane gesture — appending a video/image track always
+/// lands it there per `displayOrder`'s reversal); `y` below the bottommost lane signals
+/// "new track appended at the bottom of the audio zone" (or, if there are no audio tracks
+/// yet, the bottom of the overlay zone) — both cases return `trackIndex: null` and let the
+/// caller decide the new track's kind from what's being dropped.
+export function dropTargetAtY(
+  project: Project,
   canvasHeight: number,
-  trackCount: number,
   y: number,
   scrollY = 0,
-): number {
-  const { trackH, laneTop } = trackLayout(canvasHeight, Math.max(trackCount, 1), scrollY);
-  for (let i = 0; i < trackCount; i++) {
-    if (y < laneTop(i) + trackH + 3) return i;
+): RowDropTarget {
+  const order = displayOrder(project);
+  const { trackH, laneTop } = trackLayout(canvasHeight, Math.max(order.length, 1), scrollY);
+  if (order.length > 0 && y < laneTop(0) - trackH / 2) {
+    return { trackIndex: null, row: -1 };
   }
-  return trackCount;
+  for (let i = 0; i < order.length; i++) {
+    if (y < laneTop(i) + trackH + 3) return { trackIndex: order[i]!.trackIndex, row: i };
+  }
+  return { trackIndex: null, row: order.length };
 }
 
 export interface ClipHit {
@@ -103,21 +162,24 @@ export function hitTestClip(
   scrollX = 0,
   scrollY = 0,
 ): ClipHit | null {
-  const { trackH, laneTop } = trackLayout(canvasHeight, project.tracks.length, scrollY);
+  const order = displayOrder(project);
+  const { trackH, laneTop } = trackLayout(canvasHeight, order.length, scrollY);
 
-  for (let ti = 0; ti < project.tracks.length; ti++) {
-    const track = project.tracks[ti];
-    const y0 = laneTop(ti);
+  for (let row = 0; row < order.length; row++) {
+    const { trackIndex, track } = order[row]!;
+    const y0 = laneTop(row);
     if (y < y0 || y > y0 + trackH) continue;
     for (const clip of track.clips) {
       const cx = clipLeft(clip.position_secs, pxPerSec, scrollX);
       const cw = clipDurationSecs(clip) * pxPerSec;
       if (y < y0 + CLIP_TOP_PAD || x < cx || x > cx + cw) continue;
-      if (x <= cx + TRIM_HANDLE_PX) return { trackId: track.id, clip, trackIndex: ti, edge: "left" };
-      if (x >= cx + cw - TRIM_HANDLE_PX) {
-        return { trackId: track.id, clip, trackIndex: ti, edge: "right" };
+      if (x <= cx + TRIM_HANDLE_PX) {
+        return { trackId: track.id, clip, trackIndex, edge: "left" };
       }
-      return { trackId: track.id, clip, trackIndex: ti, edge: "body" };
+      if (x >= cx + cw - TRIM_HANDLE_PX) {
+        return { trackId: track.id, clip, trackIndex, edge: "right" };
+      }
+      return { trackId: track.id, clip, trackIndex, edge: "body" };
     }
   }
   return null;
@@ -157,13 +219,14 @@ export function listTransitionJunctions(
   scrollX = 0,
   scrollY = 0,
 ): TransitionJunction[] {
-  const { trackH, laneTop } = trackLayout(canvasHeight, project.tracks.length, scrollY);
+  const order = displayOrder(project);
+  const { trackH, laneTop } = trackLayout(canvasHeight, order.length, scrollY);
   const out: TransitionJunction[] = [];
 
-  for (let ti = 0; ti < project.tracks.length; ti++) {
-    const track = project.tracks[ti];
+  for (let row = 0; row < order.length; row++) {
+    const { trackIndex, track } = order[row]!;
     if (track.kind !== "video") continue;
-    const y = laneTop(ti);
+    const y = laneTop(row);
     const bodyY = y + CLIP_TOP_PAD;
     const bodyH = trackH - CLIP_TOP_PAD - CLIP_BOTTOM_PAD;
 
@@ -180,7 +243,7 @@ export function listTransitionJunctions(
       const overlapPx = transition ? Math.max(4, transition.duration_secs * pxPerSec) : 0;
       out.push({
         trackId: track.id,
-        trackIndex: ti,
+        trackIndex,
         outgoingClipId: clip.id,
         junctionSecs,
         junctionX,

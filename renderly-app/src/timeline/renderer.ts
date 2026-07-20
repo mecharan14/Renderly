@@ -8,6 +8,7 @@ import {
   clipLeft,
   CLIP_BOTTOM_PAD,
   CLIP_TOP_PAD,
+  displayOrder,
   listTransitionJunctions,
   RULER_H,
   secsFromCanvasX,
@@ -297,21 +298,24 @@ function drawDragGhost(
   const cw = Math.max(ghost.durationSecs * pxPerSec, 8);
   const color = ghost.valid ? theme.accent : theme.danger;
 
-  const { trackH, laneTop } = trackLayout(canvasH, Math.max(project.tracks.length, 1), scrollY);
-  const isNewTrack = ghost.trackIndex >= project.tracks.length;
-  const y = isNewTrack
-    ? laneTop(project.tracks.length)
-    : laneTop(ghost.trackIndex) + CLIP_TOP_PAD;
+  const rowCount = displayOrder(project).length;
+  const { trackH, laneTop } = trackLayout(canvasH, Math.max(rowCount, 1), scrollY);
+  const isNewTrack = ghost.trackIndex == null;
+  const y = isNewTrack ? laneTop(ghost.row) : laneTop(ghost.row) + CLIP_TOP_PAD;
   const h = isNewTrack ? trackH : trackH - CLIP_TOP_PAD - CLIP_BOTTOM_PAD;
 
   if (isNewTrack) {
+    // New-track insertion line sits at the lane's near edge: above row 0 (drop-above-top,
+    // `ghost.row === -1`) draws at the lane's bottom edge; below the last row draws at its
+    // top edge — either way, right where the new lane will appear.
+    const lineY = ghost.row < 0 ? y + trackH : y;
     ctx.save();
     ctx.strokeStyle = color;
     ctx.setLineDash([6, 4]);
     ctx.lineWidth = 2;
     ctx.beginPath();
-    ctx.moveTo(TRACK_LABEL_W, y);
-    ctx.lineTo(canvasW, y);
+    ctx.moveTo(TRACK_LABEL_W, lineY);
+    ctx.lineTo(canvasW, lineY);
     ctx.stroke();
     ctx.restore();
   }
@@ -449,7 +453,8 @@ export function renderTimeline(canvas: HTMLCanvasElement, state: TimelineRenderS
   }
 
   const duration = timelineDuration(project);
-  const { trackH, laneTop } = trackLayout(h, project.tracks.length, scrollY);
+  const order = displayOrder(project);
+  const { trackH, laneTop } = trackLayout(h, order.length, scrollY);
 
   // Lane background (scrollable content region)
   ctx.fillStyle = theme.timelineBg;
@@ -499,7 +504,7 @@ export function renderTimeline(canvas: HTMLCanvasElement, state: TimelineRenderS
   // TrackHeaders.tsx), overlaid on top of the TRACK_LABEL_W gutter reserved here — not
   // drawn on canvas, so they can be actual interactive controls (dbl-click rename,
   // toggle buttons) instead of hit-tested canvas regions.
-  project.tracks.forEach((track, i) => {
+  order.forEach(({ track }, i) => {
     const y = laneTop(i);
     if (y + trackH < RULER_H || y > h) return;
 
