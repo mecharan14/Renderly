@@ -407,14 +407,32 @@ media file ──► <video> / WebCodecs VideoDecoder (HW decode, browser-schedu
     for the incoming side of a transition and falls back to the plain media-id key, so
     different-media transitions are unaffected. Regression covered by the harness sample
     project's `c-round1a`/`c-round1b` split-clip crossfade (same `m-round1` media).
-  - Production (`vite build`) bundles do NOT include the wasm pkg (the dynamic import
-    specifier is invisible to the bundler on purpose, so builds stay green with the
-    gitignored pkg absent — verified both with and without the pkg on disk). Dev mode
-    (Tauri dev server, harness) gets the GPU path; release builds fall back to Canvas2D
-    until P3 makes the wasm path the shipped default and bundles the pkg properly.
-- **P3 — Audio + full switchover.** Captions burn-in landed (above, 2026-07-20). Remaining:
-  WebAudio mixing (or keep backend audio if simpler), remove
-  `set_preview_bounds`/child-window sync from the hot path, default the flag on.
+  - ~~Production (`vite build`) bundles do NOT include the wasm pkg~~ — resolved in P3
+    (below): the pkg now lives in `public/wasm-pkg/`, which Vite serves at the site root
+    in dev and copies verbatim into `dist/` for release builds. The dynamic import
+    specifier stays invisible to the bundler (builds remain green with the pkg absent;
+    the runtime import then throws → Canvas2D fallback).
+- **P3 — Full switchover. COMPLETE 2026-07-21.**
+  - Captions burn-in: landed 2026-07-20 (above).
+  - **Wasm pkg ships in release builds**: `build:wasm` outputs to
+    `renderly-app/public/wasm-pkg/` (gitignored); the engine imports
+    `/wasm-pkg/renderly_wasm.js`, which resolves identically in Tauri dev, the browser
+    harness (via a `configureServer` middleware in vite.harness.config.ts, since the
+    harness claims `publicDir` for dev-assets), and production `dist/`.
+    `tauri.conf.json`'s `beforeBuildCommand` runs `build:wasm` first, so a release can
+    never ship without the compositor. Verified: `dist/wasm-pkg/*` present after
+    `npm run build`; harness reports `mode: "webgpu"`, drawMs ≈ 0.3 from the new path.
+  - **Audio decision: keep backend audio.** The backend premix + rodio sink stays the
+    master clock (`playback:tick` slews the webview clock, as in P1). WebAudio mixing
+    bought no user-visible improvement over this — playback start latency and sync are
+    already good — and would have duplicated the filtergraph logic client-side.
+    Revisit only if per-clip live audio scrubbing (audible trim-drag) becomes a
+    requirement.
+  - **Hot path already clean**: `PreviewPanel` never calls `set_preview_bounds` in
+    webview mode (the native child window is never created), and the webview engine has
+    been the default since P2 (`renderly.previewEngine` localStorage opt-out).
+- **P4 — Deletion (next).** Gate: the QA checklist below on the dogfood machine, plus a
+  few weeks of daily-driving the webview path with no `"native"` opt-out needed.
 - **P4 — Deletion.** Remove `preview/{win32,macos,linux,stub}.rs`, `present_rgba`, and the
   bounds-sync effect; simplify `playback.rs` to export/scrub-server duties.
 

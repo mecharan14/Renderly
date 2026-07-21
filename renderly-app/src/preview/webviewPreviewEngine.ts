@@ -374,15 +374,16 @@ export class WebviewPreviewEngine {
         );
       }
       if (adapter) {
-        // Runtime-resolved dev-server path, deliberately invisible to Vite's static
-        // analysis (@vite-ignore + no import.meta.url — Vite constant-folds concats and
-        // globs dynamic `new URL` templates, either of which would make the build depend
-        // on the gitignored generated pkg). The Vite dev server serves project sources
-        // under /src, so this resolves in real-app dev mode (Tauri dev uses the dev
-        // server) and in the browser harness. In a production bundle it 404s and throws →
-        // Canvas2D fallback (bundling the pkg into dist is P3 work, when the wasm path
-        // becomes the shipped default — see docs/preview-webview.md P2 "build step").
-        const spec = "/src/wasm-pkg/renderly_wasm.js";
+        // Runtime-resolved path, deliberately invisible to Vite's static analysis
+        // (@vite-ignore + no import.meta.url — Vite constant-folds concats and globs
+        // dynamic `new URL` templates, either of which would make the BUILD depend on the
+        // gitignored generated pkg). The pkg lives in public/wasm-pkg (P3): Vite serves
+        // public/ at the site root in dev (real-app dev + browser harness) and copies it
+        // verbatim into dist/ for production, so this one specifier resolves in every
+        // mode. tauri.conf.json's beforeBuildCommand runs build:wasm first, so a release
+        // bundle can never ship without the pkg; if it's somehow absent the import throws
+        // → Canvas2D fallback (see docs/preview-webview.md P3).
+        const spec = "/wasm-pkg/renderly_wasm.js";
         const mod = (await import(/* @vite-ignore */ spec)) as {
           default: () => Promise<unknown>;
           WasmCompositor: { create(canvas: HTMLCanvasElement): Promise<WasmCompositorLike> };

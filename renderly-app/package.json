@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "build:wasm": "wasm-pack build ../renderly-wasm --target web --release --out-dir ../renderly-app/src/wasm-pkg --no-pack",
+    "build:wasm": "wasm-pack build ../renderly-wasm --target web --release --out-dir ../renderly-app/public/wasm-pkg --no-pack",
     "preview": "vite preview",
     "tauri": "tauri"
   },
