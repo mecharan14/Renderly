@@ -1,7 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { setClipTransform } from "../../lib/commands";
-import * as ipc from "../../lib/ipc";
-import { isWebviewPreview } from "../../preview/webviewPreviewEngine";
 import {
   applyHandleDrag,
   cursorForHandle,
@@ -81,7 +79,6 @@ type DragRef = {
   clipId: string;
   startTransform: ClipTransform;
   startNdc: { x: number; y: number };
-  lastPreviewMs: number;
   moved: boolean;
 };
 
@@ -148,22 +145,6 @@ export function PreviewHandlesOverlay({
     return () => ro.disconnect();
   }, [hostRef, aspect, project]);
 
-  // When the webview preview is active, PreviewPanel's canvas subscribes directly to the
-  // store and redraws on every optimistic patch (`patchClipTransform` below already does
-  // that) — the backend transform-override round trip is native-preview-only machinery
-  // that would just add latency here. See docs/preview-webview.md item 7.
-  const previewOverride = useCallback(
-    (trackId: string, clipId: string, t: ClipTransform) => {
-      if (isWebviewPreview()) return;
-      const now = performance.now();
-      const drag = dragRef.current;
-      if (drag && now - drag.lastPreviewMs < 40) return;
-      if (drag) drag.lastPreviewMs = now;
-      void ipc.previewTransformOverride(trackId, clipId, t, useEditorStore.getState().playhead);
-    },
-    [],
-  );
-
   const endDrag = useCallback(
     (cancel: boolean) => {
       const drag = dragRef.current;
@@ -175,14 +156,6 @@ export function PreviewHandlesOverlay({
       if (cancel || !drag.moved) {
         // Restore the pre-drag state; nothing to commit.
         patchClipTransform(drag.trackId, drag.clipId, drag.startTransform);
-        if (!isWebviewPreview()) {
-          void ipc.previewTransformOverride(
-            drag.trackId,
-            drag.clipId,
-            drag.startTransform,
-            useEditorStore.getState().playhead,
-          );
-        }
         return;
       }
       const projectNow = useEditorStore.getState().project;
@@ -210,7 +183,6 @@ export function PreviewHandlesOverlay({
       setGuides({ v: outcome.guideV, h: outcome.guideH });
       setReadout(readoutText(drag.kind, outcome.transform, projW, projH));
       patchClipTransform(drag.trackId, drag.clipId, outcome.transform);
-      previewOverride(drag.trackId, drag.clipId, outcome.transform);
     };
 
     const onUp = () => endDrag(false);
@@ -229,7 +201,7 @@ export function PreviewHandlesOverlay({
       window.removeEventListener("mouseup", onUp);
       window.removeEventListener("keydown", onKey, true);
     };
-  }, [endDrag, previewOverride, projW, projH]);
+  }, [endDrag, projW, projH]);
 
   if (!active || !bounds || active.locked || bounds.width < 8) return null;
 
@@ -281,7 +253,6 @@ export function PreviewHandlesOverlay({
       clipId: active.clip.id,
       startTransform: { ...transform },
       startNdc: pxToNdc(local, w, h),
-      lastPreviewMs: 0,
       moved: false,
     };
   };

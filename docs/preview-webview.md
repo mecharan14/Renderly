@@ -1,7 +1,10 @@
 # Webview preview migration (WASM compositor)
 
-Status: approved 2026-07-12 (supersedes the "native child-window preview" rule; AGENTS.md §0.5
-updated in the same change). This doc is the contract for the migration.
+Status: **complete 2026-07-21 (P4 shipped)** — approved 2026-07-12 (supersedes the "native
+child-window preview" rule; AGENTS.md §0.5 updated in the same change). This doc is the
+contract for the migration and the record of how it played out; the native child-window
+preview described throughout (as the pre-migration baseline, then as a runtime fallback)
+no longer exists in the codebase as of P4.
 
 ## Why
 
@@ -26,8 +29,9 @@ guides) also becomes first-class DOM instead of overlays floating over a foreign
    preview↔export parity. Export and headless (CLI/MCP `render_frame`) keep the native engine.
 2. **Command API and engine boundaries are unchanged.** This migration touches only how
    pixels reach the screen in `renderly-app`.
-3. **Native preview stays as a runtime fallback** (env/flag) until the webview path reaches
-   parity on the QA checklist, then the child-window backends are deleted in one PR.
+3. **Native preview stayed as a runtime fallback** (env/flag) until the webview path
+   reached parity on the QA checklist, then the child-window backends were deleted in P4
+   (below) — done, no fallback remains.
 
 ## Architecture
 
@@ -431,23 +435,109 @@ media file ──► <video> / WebCodecs VideoDecoder (HW decode, browser-schedu
   - **Hot path already clean**: `PreviewPanel` never calls `set_preview_bounds` in
     webview mode (the native child window is never created), and the webview engine has
     been the default since P2 (`renderly.previewEngine` localStorage opt-out).
-- **P4 — Deletion (next).** Gate: the QA checklist below on the dogfood machine, plus a
-  few weeks of daily-driving the webview path with no `"native"` opt-out needed.
-- **P4 — Deletion.** Remove `preview/{win32,macos,linux,stub}.rs`, `present_rgba`, and the
-  bounds-sync effect; simplify `playback.rs` to export/scrub-server duties.
+- **P4 — Deletion. COMPLETE 2026-07-21.** Removed the native child-window preview and
+  every opt-out/mode-switch that existed only to support it.
+
+  **What was removed:**
+  - `renderly-app/src-tauri/src/preview/` entirely — `win32.rs`, `macos.rs`, `stub.rs`,
+    `linux/{mod.rs,x11.rs,wayland.rs}`, `gfx.rs` (the shared wgpu blit pipeline —
+    `present_rgba`/`present_texture_view`/`GfxState` — and `mod.rs`'s
+    `PreviewPanel`/`PreviewBounds`/`NativeWindow` types and `cfg`-gated per-OS dispatch),
+    and `preview_blit.wgsl`. `renderly-app/src-tauri/Cargo.toml` dropped the
+    now-unreferenced `wgpu`, `pollster`, `bytemuck`, `raw-window-handle`, `windows`
+    (Win32), `objc2*` (AppKit), and `x11`/`wayland-*` (Linux) dependencies.
+  - `lib.rs`: `AppState.preview`/`parent_attached`, `native_window_from_app`,
+    `ensure_preview_parent`, the `set_preview_bounds` and `set_preview_mode` commands, and
+    the `preview_transform_override`/`preview_mask_override` commands (their only job was
+    rendering to the now-deleted native surface — the webview canvas already redraws from
+    the store patch these commands' callers make anyway). `quick_start_project`/
+    `new_project`/`open_project` no longer call `ensure_preview_parent`.
+  - `playback.rs`: `PlaybackEngine::webview_mode` (the `AtomicBool` and its
+    getter/setter), `target_height`/`set_target_size`/`decode_opts` (existed only to feed
+    panel-resolution decode to a `FrameRenderer` the play/scrub loops no longer build),
+    `request_preview`, and the entire render/present branch of `run_playback_loop` and
+    `run_scrub_worker` (`FrameRenderer`, `render_to_texture`/`render`,
+    `present_texture_view`/`present_rgba`, `PerfAccumulator`/`PlaybackPerfEvent` — the
+    decode/compose/present timings they measured no longer exist on this path). `play()`
+    and `seek()`/`refresh_frame()` are unconditional now (no `is_webview_mode()` branch)
+    since there's only one mode; `run_scrub_worker` now does nothing but the
+    `mix_timeline_audio_segment` blip for `scrub_audio`.
+  - Frontend: `isWebviewPreview()` and the `renderly.previewEngine` localStorage opt-out
+    (`webviewPreviewEngine.ts`) — every call site (`PreviewPanel.tsx`, `App.tsx`,
+    `PreviewHandlesOverlay.tsx`, `PreviewMaskOverlay.tsx`) now takes the webview path
+    unconditionally. `ipc.ts` dropped `setPreviewMode`, `setPreviewBounds`,
+    `previewTransformOverride`, `previewMaskOverride`, and the now-orphaned
+    `onWindowGeometryChange` helper. `PreviewPanel.tsx` dropped `syncPreviewBounds` and
+    its whole bounds-sync effect (it was already a no-op in webview mode — the effect's
+    own early-return made that a dead branch prior to this change). `PreviewHandlesOverlay`
+    /`PreviewMaskOverlay` dropped the `previewOverride` ephemeral-render callback and its
+    `lastPreviewMs` throttle bookkeeping; `MediaClipInspector`'s mask-feather slider
+    dropped its (unconditional, not `isWebviewPreview()`-gated) `previewMaskOverride` call.
+    `PreviewMode`'s `"native"` stats value is kept in the type (harmless, never reported)
+    since it's part of the debug-stats surface, not the deleted preview path.
+
+  **Shared-device decision: dropped, not preserved.** The A4 optimization
+  (`FrameRenderer::with_device`, sharing one wgpu device between the native preview
+  surface and playback/scrub rendering) is gone, not migrated — it has no consumer left.
+  Preview rendering was the *only* thing that ever called `with_device`; with the webview
+  owning 100% of preview pixels, `playback.rs` never constructs a `FrameRenderer` at all
+  anymore (play loop is audio-only; the scrub worker plays an audio blip and nothing
+  else). `with_device` itself stays in `renderly-core` (still valid public API, exercised
+  by its own tests) — this is purely "no remaining caller in `renderly-app`," not an API
+  removal. Export, project thumbnails, and the MCP bridge's `render_frame` all already
+  used `FrameRenderer::new` (its own device) directly and are unaffected.
+  - One real (accepted) regression from this: `AppState::render_live_frame_png` (the MCP
+    bridge's `render_frame` perception tool) used to decode at the preview panel's
+    reported height via `PlaybackEngine::target_height()` (fed by `set_preview_bounds`,
+    now deleted); it always renders at full preset/export resolution now. Slower per call,
+    never incorrect — `render_frame` is a perception tool called on demand, not a hot
+    path, so trading a little latency for deleting the whole bounds-tracking mechanism was
+    the right call.
+  - `PlaybackErrorEvent`/`playback:error` stayed alive but was repointed: it used to fire
+    on renderer-init/present failures (impossible now, there's no renderer), so it now
+    fires on audio pre-mix failure instead, keeping the event non-dead rather than
+    orphaning both the Rust type and the frontend's existing `onPlaybackError` listener.
+
+  **Cross-platform reasoning (Windows-only compile host, so this was inspected by hand,
+  not verified by a macOS/Linux `cargo build`):** every deleted native-preview file was
+  behind `#[cfg(windows)]` / `#[cfg(target_os = "macos")]` / `#[cfg(target_os = "linux")]`
+  / the catch-all `stub.rs` `#[cfg(not(any(...)))]` in `preview/mod.rs`; deleting the
+  whole `preview/` directory and its `mod` declarations removes all four arms together, so
+  no `cfg` arm is left dangling for any target. The only other `cfg`-gated preview code
+  was `lib.rs::native_window_from_app`'s per-OS `match` arms (also deleted whole) and the
+  Cargo.toml `[target.'cfg(...)'.dependencies]` blocks for `raw-window-handle`/`windows`/
+  `objc2*`/`x11`/`wayland-*` (all removed, since nothing references them on any target
+  anymore). Nothing in the kept code (`playback.rs`, `lib.rs`, `bridge.rs`) is
+  platform-gated, so macOS/Linux builds see the exact same source as the Windows build
+  verified here.
+
+  **Verification:** `cargo build/test/clippy --workspace` (clippy with
+  `--all-targets -- -D warnings`) and `cargo fmt --all` all clean on Windows; `cargo check
+  --target wasm32-unknown-unknown -p renderly-core -p renderly-wasm` clean (unaffected —
+  this deletion never touched wasm-target code); `npx tsc --noEmit` and `npm run build`
+  clean in `renderly-app`. Harness smoke test (`npm run build:wasm` then `npx vite
+  --config vite.harness.config.ts` on port 5188): opened a sample project,
+  `window.__previewStats.mode === "webgpu"`, sampled a non-black canvas pixel via a
+  same-call temp-canvas `drawImage`+`getImageData` (`[127,127,127,255]` at the canvas
+  center), toggled play/pause with no console errors, and confirmed no console references
+  to the deleted `set_preview_mode`/`set_preview_bounds` commands.
 
 ## Risks
 
-- **WebKitGTK (Linux)**: WebGPU/WebCodecs lag Chromium. Mitigation: WebGL2 fallback for the
-  compositor's final blit is not acceptable for effects parity — instead keep the native
-  fallback alive on Linux until WebKitGTK ships WebGPU, or bundle a Chromium-based webview.
+- **WebKitGTK (Linux)**: WebGPU/WebCodecs lag Chromium. There is no native fallback left
+  (deleted in P4) — a WebKitGTK build without WebGPU falls back to the P1 Canvas2D path
+  (no effects/masks/captions, see the Canvas2D fallback note in P2 above) rather than to
+  native rendering. Revisit if this proves unacceptable on real Linux distros: either a
+  WebGL2 blit path (previously rejected for breaking effects parity — see the P2
+  Canvas2D-fallback caption gap for the same tradeoff already accepted elsewhere) or
+  bundling a Chromium-based webview.
 - **wasm32 build of wgpu/compose**: naga/WebGPU limits (no `Rgba8UnormSrgb` storage, texture
   limits). Mitigation: the compositor already targets downlevel wgpu; CI adds a
   `cargo check --target wasm32-unknown-unknown -p renderly-core --features wasm-compositor`.
 - **Memory**: VideoFrames must be `close()`d promptly; leak = decoder stall. Enforce in the
   player abstraction, not call sites.
 
-## QA gate (flip default / delete native)
+## QA gate (pre-P4 flip-default gate, now historical)
 
 The existing `docs/qa-checklist.md` preview section, plus: 4K60 source on the dogfood
 machine, 3 simultaneous video tracks + 2 effects at 60fps, scrub-storm test (drag the

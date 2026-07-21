@@ -40,29 +40,16 @@ function enqueueInit<T>(work: () => Promise<T>): Promise<T> {
   return run;
 }
 
-/// localStorage flag: set to "native" to opt back into the native wgpu child-window
-/// preview (fallback during the migration — see docs/preview-webview.md phase P3/P4).
-/// Any other value (including unset) uses the webview engine, which is the default.
-const PREVIEW_ENGINE_KEY = "renderly.previewEngine";
-
-export function isWebviewPreview(): boolean {
-  try {
-    return localStorage.getItem(PREVIEW_ENGINE_KEY) !== "native";
-  } catch {
-    // localStorage unavailable (e.g. some sandboxed contexts) — default to the new path.
-    return true;
-  }
-}
-
 /// Debug/QA stats exposed on `window.__previewStats` in dev builds (see harness
 /// verification requirements in docs/preview-webview.md). Not present in production.
 export interface PreviewStats {
   fps: number;
   drawMs: number;
   drops: number;
-  /// Which pixel path is live: "webgpu" (wasm compositor), "canvas2d" (P1 fallback).
-  /// The "native" value is never reported by this engine — the native child-window path
-  /// doesn't instantiate it at all (see isWebviewPreview()).
+  /// Which pixel path is live: "webgpu" (wasm compositor), "canvas2d" (P1 fallback). The
+  /// "native" value is retained in the type for historical stats compatibility but is
+  /// never reported — the native child-window preview was removed in P4 (see
+  /// docs/preview-webview.md).
   mode: PreviewMode;
 }
 

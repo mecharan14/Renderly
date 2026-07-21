@@ -1,7 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { setClipMask } from "../../lib/commands";
 import * as ipc from "../../lib/ipc";
-import { isWebviewPreview } from "../../preview/webviewPreviewEngine";
 import {
   applyMaskHandleDrag,
   boundsToEllipseKind,
@@ -94,7 +93,6 @@ type DragRef =
       startUv: { u: number; v: number };
       shape: "rect" | "ellipse";
       base: ClipMask;
-      lastPreviewMs: number;
     }
   | {
       mode: "create";
@@ -104,7 +102,6 @@ type DragRef =
       ellipse: boolean;
       fromCenter: boolean;
       baseFeather: number;
-      lastPreviewMs: number;
     };
 
 export function PreviewMaskOverlay({
@@ -156,18 +153,6 @@ export function PreviewMaskOverlay({
     return () => ro.disconnect();
   }, [hostRef, aspect, project]);
 
-  // P1 scope limit: masks are not yet composited in the webview preview (see
-  // docs/preview-webview.md item 9 / P2), so this backend-render override has nothing to
-  // show there either — skip it rather than pay the round-trip for no visible effect.
-  const previewOverride = useCallback((trackId: string, clipId: string, next: ClipMask | null) => {
-    if (isWebviewPreview()) return;
-    const now = performance.now();
-    const drag = dragRef.current;
-    if (drag && now - drag.lastPreviewMs < 40) return;
-    if (drag) drag.lastPreviewMs = now;
-    void ipc.previewMaskOverride(trackId, clipId, next, useEditorStore.getState().playhead);
-  }, []);
-
   useEffect(() => {
     const onMove = (ev: MouseEvent) => {
       const drag = dragRef.current;
@@ -194,7 +179,6 @@ export function PreviewMaskOverlay({
         const kind = drag.ellipse ? boundsToEllipseKind(box) : boundsToRectKind(box);
         const next = defaultMask(kind, drag.baseFeather);
         patchClipMask(drag.trackId, drag.clipId, next);
-        previewOverride(drag.trackId, drag.clipId, next);
         return;
       }
 
@@ -203,7 +187,6 @@ export function PreviewMaskOverlay({
         drag.shape === "ellipse" ? boundsToEllipseKind(nextBounds) : boundsToRectKind(nextBounds);
       const next: ClipMask = { ...drag.base, kind };
       patchClipMask(drag.trackId, drag.clipId, next);
-      previewOverride(drag.trackId, drag.clipId, next);
     };
 
     const onUp = async () => {
@@ -239,7 +222,7 @@ export function PreviewMaskOverlay({
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
     };
-  }, [cover, dispatch, previewOverride, setDragging, transform]);
+  }, [cover, dispatch, setDragging, transform]);
 
   if (!active || !bounds || active.locked || bounds.width < 8) return null;
 
@@ -274,7 +257,6 @@ export function PreviewMaskOverlay({
           feather: mask.feather ?? 0,
           kind: mask.kind,
         },
-        lastPreviewMs: 0,
       };
       return;
     }
@@ -292,7 +274,6 @@ export function PreviewMaskOverlay({
       ellipse: ev.shiftKey,
       fromCenter: ev.altKey,
       baseFeather: mask?.feather ?? 0.05,
-      lastPreviewMs: 0,
     };
   };
 

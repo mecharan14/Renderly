@@ -27,7 +27,6 @@ import { Tooltip } from "../ui/Tooltip";
 import { KeyframeEditor } from "./KeyframeEditor";
 import { EffectList } from "../leftpanel/EffectsPanel";
 import { MulticamSection } from "./MulticamSection";
-import * as ipc from "../../lib/ipc";
 
 const AUDIO_ROLES: { value: TrackAudioRole | ""; label: string }[] = [
   { value: "", label: "None" },
@@ -443,13 +442,6 @@ export function MediaClipInspector({ track, clip }: { track: Track; clip: MediaC
                         if (!m) return;
                         const v = parseFloat(e.target.value);
                         setMaskFeather(v);
-                        const next = { ...m, enabled, invert, feather: v };
-                        void ipc.previewMaskOverride(
-                          track.id,
-                          clip.id,
-                          next,
-                          useEditorStore.getState().playhead,
-                        );
                       }}
                       onMouseUp={(e) => {
                         if (!m) return;

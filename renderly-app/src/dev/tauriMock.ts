@@ -360,8 +360,6 @@ function startMockPlayback(fromSecs: number): void {
 export function invoke<T = unknown>(cmd: string, args?: any): Promise<T> {
   const reply = (v: unknown) => Promise.resolve(v as T);
   switch (cmd) {
-    case "set_preview_mode":
-      return reply(undefined);
     case "play":
       startMockPlayback((args?.timeSecs as number) ?? 0);
       return reply(undefined);

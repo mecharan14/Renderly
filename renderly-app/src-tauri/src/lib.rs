@@ -1,19 +1,15 @@
 mod media_assets;
 mod playback;
-mod preview;
 
 mod bridge;
 
 use parking_lot::Mutex;
 use playback::PlaybackEngine;
-use preview::{NativeWindow, PreviewBounds, PreviewPanel};
 use renderly_core::{
-    apply_command as apply_core_command,
-    commands::ExportPreset,
-    encode_rgba_png, export_project_with_settings,
-    project::{ClipMask, ClipTransform, Project},
-    Command, CommandOutcome, DecodeOptions, ExportError, ExportPhase, ExportProgress,
-    ExportSettings, FrameRenderer, VideoEncoderPreference,
+    apply_command as apply_core_command, commands::ExportPreset, encode_rgba_png,
+    export_project_with_settings, project::Project, Command, CommandOutcome, DecodeOptions,
+    ExportError, ExportPhase, ExportProgress, ExportSettings, FrameRenderer,
+    VideoEncoderPreference,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -172,8 +168,6 @@ struct ProjectChanged {
 
 pub struct AppState {
     session: Mutex<Option<Session>>,
-    preview: Mutex<PreviewPanel>,
-    parent_attached: Mutex<bool>,
     pub(crate) playback: PlaybackEngine,
     history: Mutex<History>,
     revision: AtomicU64,
@@ -199,8 +193,6 @@ impl AppState {
     fn new() -> Self {
         Self {
             session: Mutex::new(None),
-            preview: Mutex::new(PreviewPanel::new()),
-            parent_attached: Mutex::new(false),
             playback: PlaybackEngine::new(),
             history: Mutex::new(History::new()),
             revision: AtomicU64::new(0),
@@ -231,36 +223,22 @@ impl AppState {
         self.revision.load(Ordering::SeqCst)
     }
 
-    /// E3: render a PNG of the live session project at preview resolution (playback
-    /// target height), not a fresh headless export-size frame. `preset_for_aspect`
-    /// seeds fps/encode defaults; width/height are overridden when the preview panel
-    /// has reported a non-zero target size.
+    /// E3: render a PNG of the live session project via its own `FrameRenderer` (headless,
+    /// independent of playback/preview — the webview owns preview rendering entirely, so
+    /// this is the MCP live-agent bridge's only render path; see `bridge.rs`'s
+    /// `render_frame` handler). Renders at `preset_for_aspect`'s export resolution; the P4
+    /// removal of the native preview surface also removed the preview-panel-size decode
+    /// hint this used to honor (`PlaybackEngine::target_height`), so this now always
+    /// renders at full preset resolution.
     pub(crate) fn render_live_frame_png(
         &self,
         time_secs: f64,
         preset_for_aspect: ExportPreset,
     ) -> Result<Vec<u8>, String> {
         let project = self.with_session(|s| Ok(Arc::clone(&s.project)))?;
-        let mut settings = ExportSettings::from_preset(&preset_for_aspect, &project);
-        let target_h = self.playback.target_height();
-        if target_h > 0 {
-            let src_h = project.settings.height.max(1);
-            let aspect = project.settings.width as f64 / src_h as f64;
-            let mut h = (target_h / 2) * 2;
-            if h == 0 {
-                h = 2;
-            }
-            let mut w = ((aspect * h as f64).round() as u32).max(2);
-            w = (w / 2) * 2;
-            settings.width = w.max(2);
-            settings.height = h;
-        }
+        let settings = ExportSettings::from_preset(&preset_for_aspect, &project);
         let decode_opts = DecodeOptions {
-            target_height: if target_h > 0 {
-                Some(settings.height)
-            } else {
-                None
-            },
+            target_height: None,
             output_fps: None,
         };
         let mut renderer = FrameRenderer::new(settings, decode_opts).map_err(|e| e.to_string())?;
@@ -512,89 +490,6 @@ impl AppState {
     }
 }
 
-#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
-fn native_window_from_app(app: &AppHandle) -> Result<NativeWindow, String> {
-    #[cfg(target_os = "linux")]
-    use raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-
-    let window = app
-        .get_webview_window("main")
-        .ok_or_else(|| "main window not found".to_string())?;
-    let handle = window
-        .window_handle()
-        .map_err(|e| format!("window handle: {e}"))?;
-    match handle.as_raw() {
-        #[cfg(windows)]
-        RawWindowHandle::Win32(h) => Ok(NativeWindow { hwnd: h.hwnd.get() }),
-        #[cfg(target_os = "macos")]
-        RawWindowHandle::AppKit(h) => Ok(NativeWindow {
-            ns_view: h.ns_view.as_ptr() as usize,
-        }),
-        #[cfg(target_os = "linux")]
-        RawWindowHandle::Xlib(h) => {
-            let display = window
-                .display_handle()
-                .map_err(|e| format!("display handle: {e}"))?;
-            match display.as_raw() {
-                RawDisplayHandle::Xlib(d) => {
-                    let display_ptr = d
-                        .display
-                        .ok_or_else(|| "Xlib display pointer is null".to_string())?
-                        .as_ptr();
-                    Ok(NativeWindow::X11 {
-                        display: display_ptr as usize,
-                        window: h.window as u32,
-                    })
-                }
-                other => Err(format!(
-                    "Xlib window handle without Xlib display: {other:?}"
-                )),
-            }
-        }
-        #[cfg(target_os = "linux")]
-        RawWindowHandle::Wayland(w) => {
-            let display = window
-                .display_handle()
-                .map_err(|e| format!("display handle: {e}"))?;
-            match display.as_raw() {
-                RawDisplayHandle::Wayland(d) => Ok(NativeWindow::Wayland {
-                    display: d.display.as_ptr() as usize,
-                    surface: w.surface.as_ptr() as usize,
-                }),
-                other => Err(format!(
-                    "Wayland window handle without Wayland display: {other:?}"
-                )),
-            }
-        }
-        #[cfg(target_os = "linux")]
-        other => Err(format!(
-            "native preview requires X11 or Wayland window handle: {other:?}"
-        )),
-        #[cfg(not(target_os = "linux"))]
-        other => Err(format!("unsupported window handle: {other:?}")),
-    }
-}
-
-#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
-fn native_window_from_app(_app: &AppHandle) -> Result<NativeWindow, String> {
-    Err("native preview is not supported on this platform".into())
-}
-
-fn ensure_preview_parent(app: &AppHandle, state: &AppState) -> Result<(), String> {
-    let mut attached = state.parent_attached.lock();
-    if *attached {
-        return Ok(());
-    }
-    let parent = native_window_from_app(app).inspect_err(|e| {
-        eprintln!("preview: failed to attach parent window: {e}");
-    })?;
-    eprintln!("preview: attached parent window {parent:?}");
-    state.preview.lock().attach_parent(parent);
-    *attached = true;
-    Ok(())
-}
-
 /// Stops any active playback session, joining its worker thread from `spawn_blocking`
 /// rather than the calling async command's own worker thread. `PlaybackEngine::stop()`
 /// can block for as long as an in-flight audio premix takes (multi-second, on a long
@@ -679,13 +574,6 @@ async fn quick_start_project(app: AppHandle, state: State<'_, AppState>) -> Resu
 
     let _edit_guard = state.edit_lock.lock().await;
     stop_playback_blocking(&app).await;
-    // Checked before any session/file mutation below: on a failure here (guaranteed on
-    // non-Windows builds, possible transiently on Windows if the main window isn't ready
-    // yet), we must not have already written a project file or set `state.session` — the
-    // frontend sees this error and assumes no project is open, so the backend can't be
-    // left holding one anyway (or, on the create-project commands, a real file already
-    // sitting on disk that the project that "failed to open" never gets to reference).
-    ensure_preview_parent(&app, &state)?;
 
     let dir = default_projects_dir()?;
     let existing = existing_project_name_stems(&dir);
@@ -738,7 +626,6 @@ async fn new_project(
 
     let _edit_guard = state.edit_lock.lock().await;
     stop_playback_blocking(&app).await;
-    ensure_preview_parent(&app, &state)?;
 
     let path_buf = PathBuf::from(&path);
     let project = Project::new(
@@ -784,7 +671,6 @@ async fn open_project(
 ) -> Result<(), String> {
     let _edit_guard = state.edit_lock.lock().await;
     stop_playback_blocking(&app).await;
-    ensure_preview_parent(&app, &state)?;
 
     let path_buf = PathBuf::from(&path);
     let read_path = path_buf.clone();
@@ -1472,77 +1358,12 @@ async fn cancel_export(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
-/// Deliberately a *sync* command, not `async fn`. Tauri dispatches sync commands on the
-/// main thread, which is required here: this is the only call site that creates the
-/// native preview child HWND and its wgpu swapchain (`PreviewPanel::set_bounds` ->
-/// `ensure_child_window` / `GfxState::new`), and Win32 windows must be created on a
-/// thread that pumps messages for them — creating one from an async command's background
-/// worker thread hangs (see docs/architecture.md "Playback engine" risk notes). Frame
-/// *presentation* from the playback/scrub worker threads onto this already-created
-/// surface is fine and unaffected by this.
-///
-/// `x`/`y`/`width`/`height` arrive as CSS logical pixels (`getBoundingClientRect()`).
-/// Win32 window APIs for a DPI-aware process expect *physical* pixels, so on any monitor
-/// scaled above 100% (125%/150%/etc. — the common case, not the exception), passing the
-/// logical values straight through undersizes and mispositions the child HWND, which is
-/// why the preview can render "successfully" (no errors) while showing nothing visible.
-#[tauri::command]
-fn set_preview_bounds(
-    app: AppHandle,
-    state: State<AppState>,
-    x: i32,
-    y: i32,
-    width: u32,
-    height: u32,
-) -> Result<(), String> {
-    ensure_preview_parent(&app, &state)?;
-    let scale = app
-        .get_webview_window("main")
-        .and_then(|w| w.scale_factor().ok())
-        .unwrap_or(1.0);
-    let to_px = |v: i32| -> i32 { (v as f64 * scale).round() as i32 };
-    let to_pu = |v: u32| -> u32 { (v as f64 * scale).round() as u32 };
-    let width_px = to_pu(width);
-    let height_px = to_pu(height);
-
-    // Even-round so scale=-2:h in the decoder never has to round again.
-    state.playback.set_target_size((height_px / 2) * 2);
-    state
-        .preview
-        .lock()
-        .set_bounds(PreviewBounds {
-            x: to_px(x),
-            y: to_px(y),
-            width: width_px,
-            height: height_px,
-        })
-        .map_err(|e| e.to_string())
-}
-
-/// P1 webview preview migration (docs/preview-webview.md item 10): switches the playback
-/// engine between "webview" (browser decodes/presents video; this backend does audio-only
-/// playback) and "native" (the pre-migration wgpu child-window path). Called once at
-/// startup by the frontend based on `isWebviewPreview()`. Synchronous/non-blocking — just
-/// flips an `AtomicBool`, takes effect on the next `play`/`seek`/`refresh_frame`.
-#[tauri::command]
-fn set_preview_mode(state: State<AppState>, mode: String) -> Result<(), String> {
-    match mode.as_str() {
-        "webview" => state.playback.set_webview_mode(true),
-        "native" => state.playback.set_webview_mode(false),
-        other => return Err(format!("unknown preview mode: {other}")),
-    }
-    Ok(())
-}
-
 /// Start (or resume) playback from `time_secs`. Non-blocking: hands an `Arc<Project>`
-/// off to the playback worker thread and returns immediately — see playback.rs.
+/// off to the playback worker thread and returns immediately — see playback.rs. The
+/// webview owns all video presentation; this only drives the audio clock and
+/// `playback:tick` emission (see playback.rs's module doc comment).
 #[tauri::command]
 async fn play(app: AppHandle, state: State<'_, AppState>, time_secs: f64) -> Result<(), String> {
-    // Webview mode never presents to the native surface (see playback.rs's
-    // `run_playback_loop` doc comment) — don't create the native child window for it.
-    if !state.playback.is_webview_mode() {
-        ensure_preview_parent(&app, &state)?;
-    }
     state.set_playhead_secs(time_secs);
     let project = state.with_session(|s| Ok(Arc::clone(&s.project)))?;
     state.playback.play(app, project, time_secs);
@@ -1564,131 +1385,38 @@ async fn pause(app: AppHandle, state: State<'_, AppState>) -> Result<f64, String
 
 /// Jump the playhead to `time_secs`. While playing, this coalesces into the running
 /// playback loop (audio/decoders restart from the new position without a pause/resume
-/// round trip). While paused, it renders one frame via the scrub worker.
+/// round trip). While paused, the webview canvas repaints itself
+/// (`WebviewPreviewEngine.seek`) — there is no backend-side paused-state render anymore.
 #[tauri::command]
-async fn seek(app: AppHandle, state: State<'_, AppState>, time_secs: f64) -> Result<(), String> {
+async fn seek(state: State<'_, AppState>, time_secs: f64) -> Result<(), String> {
     state.set_playhead_secs(time_secs);
-    if state.playback.seek_while_playing(time_secs) {
-        return Ok(());
-    }
-    // Webview mode: the paused-state paint is the webview canvas's own scrub redraw
-    // (`WebviewPreviewEngine.seek`) — skip the native scrub-worker render entirely, see
-    // docs/preview-webview.md item 10.
-    if state.playback.is_webview_mode() {
-        return Ok(());
-    }
-    ensure_preview_parent(&app, &state)?;
-    let project = state.with_session(|s| Ok(Arc::clone(&s.project)))?;
-    state.playback.request_preview(app, project, time_secs);
+    state.playback.seek_while_playing(time_secs);
     Ok(())
 }
 
-/// Refresh the preview after an edit that didn't go through `seek` (e.g. `apply_command`,
+/// Refresh playback after an edit that didn't go through `seek` (e.g. `apply_command`,
 /// `apply_commands`, `undo`, `redo`). Deliberately distinct from `seek`: while playing,
 /// `seek` restarts the play loop from a new position (stops the audio sink, re-premixes,
 /// reopens decoders) — appropriate for an actual scrub, wildly disruptive for "the
 /// inspector's opacity slider moved" or "a clip got trimmed". This instead live-swaps the
 /// project into the running session (see `PlaybackEngine::update_live_project`) so the
-/// next already-scheduled frame just renders the new state; while paused, it renders one
-/// frame at the given time via the scrub worker, same as `seek`'s paused-state path.
+/// next already-scheduled frame's audio reflects the new state; the webview canvas
+/// repaints itself from the same store patch (`WebviewPreviewEngine.notifyProjectPatched`)
+/// regardless of play state.
 #[tauri::command]
-async fn refresh_frame(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    time_secs: f64,
-) -> Result<(), String> {
+async fn refresh_frame(state: State<'_, AppState>) -> Result<(), String> {
     let project = state.with_session(|s| Ok(Arc::clone(&s.project)))?;
-    if state.playback.update_live_project(Arc::clone(&project)) {
-        return Ok(());
-    }
-    // Webview mode: paused-state repaint is the webview canvas's own store-subscription
-    // redraw (`WebviewPreviewEngine.notifyProjectPatched`) — see docs/preview-webview.md
-    // item 10.
-    if state.playback.is_webview_mode() {
-        return Ok(());
-    }
-    ensure_preview_parent(&app, &state)?;
-    state.playback.request_preview(app, project, time_secs);
+    state.playback.update_live_project(project);
     Ok(())
 }
 
-/// Live preview during transform-handle drag: clone session project, patch one clip's
-/// transform ephemerally (no undo / no disk write), render one frame. Throttled by the UI.
+/// Render a short audio blip at `time_secs` (timeline scrub feedback). Non-blocking and
+/// coalesced — safe to call on every pointermove during a drag. The visual scrub redraw
+/// is entirely the webview canvas's own doing; this only drives the audio cue.
 #[tauri::command]
-async fn preview_transform_override(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    track_id: String,
-    clip_id: String,
-    transform: ClipTransform,
-    time_secs: f64,
-) -> Result<(), String> {
-    ensure_preview_parent(&app, &state)?;
-    let track_uuid: uuid::Uuid = track_id.parse().map_err(|e: uuid::Error| e.to_string())?;
-    let clip_uuid: uuid::Uuid = clip_id.parse().map_err(|e: uuid::Error| e.to_string())?;
-    let mut project = state.with_session(|s| Ok((*s.project).clone()))?;
-    let track = project
-        .find_track_mut(track_uuid)
-        .ok_or_else(|| format!("track not found: {track_id}"))?;
-    let clip = track
-        .clips
-        .iter_mut()
-        .find(|c| c.id() == clip_uuid)
-        .ok_or_else(|| format!("clip not found: {clip_id}"))?;
-    let media = clip
-        .as_media_mut()
-        .ok_or_else(|| "preview override requires a media clip".to_string())?;
-    media.transform = transform.clamp_opacity();
-    state
-        .playback
-        .request_preview(app, Arc::new(project), time_secs);
-    Ok(())
-}
-
-/// Live preview during mask-handle drag: clone session project, patch one clip's
-/// mask ephemerally (no undo / no disk write), render one frame. Throttled by the UI.
-#[tauri::command]
-async fn preview_mask_override(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    track_id: String,
-    clip_id: String,
-    mask: Option<ClipMask>,
-    time_secs: f64,
-) -> Result<(), String> {
-    ensure_preview_parent(&app, &state)?;
-    let track_uuid: uuid::Uuid = track_id.parse().map_err(|e: uuid::Error| e.to_string())?;
-    let clip_uuid: uuid::Uuid = clip_id.parse().map_err(|e: uuid::Error| e.to_string())?;
-    let mut project = state.with_session(|s| Ok((*s.project).clone()))?;
-    let track = project
-        .find_track_mut(track_uuid)
-        .ok_or_else(|| format!("track not found: {track_id}"))?;
-    let clip = track
-        .clips
-        .iter_mut()
-        .find(|c| c.id() == clip_uuid)
-        .ok_or_else(|| format!("clip not found: {clip_id}"))?;
-    let media = clip
-        .as_media_mut()
-        .ok_or_else(|| "preview override requires a media clip".to_string())?;
-    media.mask = mask;
-    state
-        .playback
-        .request_preview(app, Arc::new(project), time_secs);
-    Ok(())
-}
-
-/// Render a frame + play a short audio blip at `time_secs` (timeline scrub feedback).
-/// Non-blocking and coalesced — safe to call on every pointermove during a drag.
-#[tauri::command]
-async fn scrub_audio(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    time_secs: f64,
-) -> Result<(), String> {
-    ensure_preview_parent(&app, &state)?;
+async fn scrub_audio(state: State<'_, AppState>, time_secs: f64) -> Result<(), String> {
     let project = state.with_session(|s| Ok(Arc::clone(&s.project)))?;
-    state.playback.request_scrub_audio(app, project, time_secs);
+    state.playback.request_scrub_audio(project, time_secs);
     Ok(())
 }
 
@@ -1738,14 +1466,10 @@ pub fn run() {
             redo,
             export_project,
             cancel_export,
-            set_preview_bounds,
-            set_preview_mode,
             play,
             pause,
             seek,
             refresh_frame,
-            preview_transform_override,
-            preview_mask_override,
             scrub_audio,
             set_editor_selection,
             request_media_assets,

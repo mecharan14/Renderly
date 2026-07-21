@@ -57,9 +57,12 @@ Not affiliated with, endorsed by, or a clone of any commercial editor.
 **Pre-alpha, moving fast.** Phases 0–3 of [PLAN.md](PLAN.md) are complete; Phase 4's parity
 march (background removal, motion tracking, stabilization, auto-reframe, templates, multicam)
 has heuristic implementations landed, with ML upgrades on hold. Recent highlights: the WebGPU
-preview migration (native child-window preview retired), live caption burn-in in preview,
-project home screen with auto-save and self-refreshing thumbnails, and the live agent bridge
-running end-to-end. Current workstreams: [docs/improvement-plan.md](docs/improvement-plan.md).
+preview migration is complete end to end — the native per-OS child-window preview and its
+Win32/AppKit/X11/Wayland backends are deleted, the webview canvas is the only preview path
+(see [docs/preview-webview.md](docs/preview-webview.md)) — plus live caption burn-in in
+preview, a project home screen with auto-save and self-refreshing thumbnails, and the live
+agent bridge running end-to-end. Current workstreams:
+[docs/improvement-plan.md](docs/improvement-plan.md).
 
 Windows is the primary target today; macOS/Linux build in CI and are next in line for runtime QA.
 

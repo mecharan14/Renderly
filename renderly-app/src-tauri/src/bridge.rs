@@ -209,23 +209,20 @@ async fn dispatch(
                 .and_then(|v| v.as_f64())
                 .ok_or_else(|| "params.time_secs required".to_string())?;
             state.set_playhead_secs(time);
-            if !state.playback.seek_while_playing(time) {
-                let project = state.with_session(|s| Ok(Arc::clone(&s.project)))?;
-                state.playback.request_preview(app.clone(), project, time);
-            }
+            // While playing, coalesce into the running play session. While paused, there
+            // is nothing left to do backend-side — the webview canvas repaints itself
+            // from the playhead the frontend reads via `bridge:playhead`/status polling.
+            state.playback.seek_while_playing(time);
             Ok(json!({ "ok": true }))
         }
         "set_playhead" => {
-            // E3: move the user's playhead (and preview) so the agent can direct attention.
+            // E3: move the user's playhead so the agent can direct attention.
             let time = params
                 .get("time_secs")
                 .and_then(|v| v.as_f64())
                 .ok_or_else(|| "params.time_secs required".to_string())?;
             state.set_playhead_secs(time);
-            if !state.playback.seek_while_playing(time) {
-                let project = state.with_session(|s| Ok(Arc::clone(&s.project)))?;
-                state.playback.request_preview(app.clone(), project, time);
-            }
+            state.playback.seek_while_playing(time);
             let _ = app.emit("bridge:playhead", json!({ "time_secs": time }));
             Ok(json!({ "ok": true, "time_secs": time }))
         }
@@ -262,8 +259,8 @@ async fn dispatch(
             Ok(json!({ "ok": true, "output_path": output_for_result }))
         }
         "render_frame" => {
-            // E3: live FrameRenderer at preview resolution (session project + playback
-            // target height), not a fresh headless export-size perceive render.
+            // E3: a fresh `FrameRenderer` over the live session project (not a headless
+            // reload from disk) — see `AppState::render_live_frame_png`.
             let time = params
                 .get("time_secs")
                 .and_then(|v| v.as_f64())

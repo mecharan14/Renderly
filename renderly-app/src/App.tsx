@@ -12,17 +12,12 @@ import { connectStoreToBackendEvents, useEditorStore } from "./store/editorStore
 import * as ipc from "./lib/ipc";
 import { importFromPath } from "./lib/projectFlows";
 import { handleGlobalKeyDown } from "./lib/actions";
-import { isWebviewPreview } from "./preview/webviewPreviewEngine";
 
 export function App() {
   const [exportOpen, setExportOpen] = useState(false);
   const projectPath = useEditorStore((s) => s.projectPath);
 
   useEffect(() => connectStoreToBackendEvents(), []);
-
-  useEffect(() => {
-    void ipc.setPreviewMode(isWebviewPreview() ? "webview" : "native").catch(() => {});
-  }, []);
 
   // Root-cause fix for thumbnails/waveforms intermittently missing on reopen: generation
   // on the backend is push-only (`media:thumbnails-ready` / `media:waveform-ready`), and

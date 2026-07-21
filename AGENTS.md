@@ -35,9 +35,12 @@ PR. If one of these seems wrong, say so explicitly and ask — do not quietly wo
    docs/preview-webview.md.) The preview renders into a `<canvas>` in the webview:
    browser-native decode (WebCodecs / video pipeline) feeds the **same `renderly-core`
    compositor compiled to wasm32** — never a hand-rolled JS reimplementation of effects,
-   which would break preview↔export parity. The native wgpu child-window preview remains
-   as a fallback during the migration and is removed once the webview path reaches parity.
-   Export and headless rendering continue to use the native engine unchanged.
+   which would break preview↔export parity. **P4 (2026-07-21): the native wgpu
+   child-window preview and its per-OS backends (`preview/{win32,macos,linux/x11,
+   linux/wayland}.rs`) are deleted** — the webview path is the only preview path now, no
+   opt-out flag remains. Export and headless rendering (including the MCP bridge's
+   `render_frame`) continue to use `renderly-core::FrameRenderer` directly, unaffected by
+   this deletion.
 6. **Plugins are sandboxed WASM (code) or declarative asset packs (no code).** Never add a
    plugin mechanism that loads native dynamic libraries or unsandboxed scripts.
 7. **No paywalled or cloud-only-by-default features.** Local models (Whisper, local TTS)
@@ -61,9 +64,11 @@ renderly-mcp/      MCP server exposing renderly-core commands + perception tools
                    perception to the app's loopback WebSocket bridge (docs/bridge-protocol.md);
                    otherwise it operates headlessly on the project file.
 renderly-app/      Tauri 2 desktop app. Rust backend calls renderly-core; frontend (src/) is
-                   the webview UI chrome; native preview surface is separate from the webview.
-                   src-tauri/src/bridge.rs hosts the live-agent bridge (loopback-only, token
-                   auth); agent edits share the app's undo history.
+                   the webview UI chrome, including the preview canvas (renderly-wasm
+                   compositor) — there is no separate native preview surface (removed P4,
+                   docs/preview-webview.md). src-tauri/src/bridge.rs hosts the live-agent
+                   bridge (loopback-only, token auth); agent edits share the app's undo
+                   history.
 docs/              specs that are the source of truth: schema, command API, architecture,
                    bridge protocol, design system (docs/design-system.md).
 PLAN.md            product vision, roadmap, tech stack rationale. Not a spec — read docs/ for that.

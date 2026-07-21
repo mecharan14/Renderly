@@ -37,7 +37,8 @@ extension `.renderly.json`.
 |---|---|
 | `mask` | Optional `ClipMask` — shape / raster / generated matte; invert + feather.
   Shape UVs are source-frame (0..1). Rect/ellipse authoring is via the app Mask tool
-  overlay + `SetClipMask` (live drag uses ephemeral `preview_mask_override`). |
+  overlay + `SetClipMask` (live drag patches the Zustand store directly for the preview
+  canvas's own redraw — no backend round trip; see docs/preview-webview.md P4). |
 | `background_removal` | Optional config (`model_id` `heuristic` or CLI-backed `rvm`/`birefnet`, threshold, feather, `matte_cache_dir`). |
 | `audio_denoise` | Optional `{ enabled, backend: "afftdn", strength }` — **audio tracks only** in v1. |
 | `multicam_group_id` | Optional link into `project.multicam_groups`. |

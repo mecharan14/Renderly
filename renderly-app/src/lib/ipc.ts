@@ -6,7 +6,7 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import type { ClipTransform, Project } from "./types";
+import type { Project } from "./types";
 
 export interface HistoryStatus {
   can_undo: boolean;
@@ -295,23 +295,6 @@ export function assetUrl(path: string): string {
 
 // ---- Preview / playback ----
 
-/// P1 webview preview migration (docs/preview-webview.md): tells the backend which mode
-/// the frontend is rendering in. "webview" makes the play loop skip all video decode/
-/// present work (audio-only + `playback:tick`); "native" is the pre-migration behavior.
-/// Called once at startup from `App.tsx` based on `isWebviewPreview()`.
-export function setPreviewMode(mode: "webview" | "native"): Promise<void> {
-  return invoke("set_preview_mode", { mode });
-}
-
-export function setPreviewBounds(
-  x: number,
-  y: number,
-  width: number,
-  height: number,
-): Promise<void> {
-  return invoke("set_preview_bounds", { x, y, width, height });
-}
-
 export function play(timeSecs: number): Promise<void> {
   return invoke("play", { timeSecs });
 }
@@ -334,46 +317,19 @@ export function seek(timeSecs: number): Promise<void> {
   return invoke("seek", { timeSecs });
 }
 
-/// Refresh the preview after an edit (apply_command/apply_commands/undo/redo) without the
+/// Refresh playback after an edit (apply_command/apply_commands/undo/redo) without the
 /// disruption of a real seek. While playing, this live-swaps the project into the running
-/// play session (no pause, no audio restart, no decoder respawn); while paused, it renders
-/// one frame at `timeSecs` — see the Rust `refresh_frame` command's doc comment.
+/// play session (no pause, no audio restart) so the next audio chunk reflects the edit;
+/// the preview canvas repaints itself from the same store patch regardless of play state
+/// — see the Rust `refresh_frame` command's doc comment. `timeSecs` is accepted for call-
+/// site symmetry with `seek` but isn't forwarded (the backend command no longer needs it).
 export function refreshFrame(timeSecs: number): Promise<void> {
-  return invoke("refresh_frame", { timeSecs });
+  void timeSecs;
+  return invoke("refresh_frame");
 }
 
 export function scrubAudio(timeSecs: number): Promise<void> {
   return invoke("scrub_audio", { timeSecs });
-}
-
-/** Ephemeral transform for live preview-handle drag (no undo / no session write). */
-export function previewTransformOverride(
-  trackId: string,
-  clipId: string,
-  transform: ClipTransform,
-  timeSecs: number,
-): Promise<void> {
-  return invoke("preview_transform_override", {
-    trackId,
-    clipId,
-    transform,
-    timeSecs,
-  });
-}
-
-/** Ephemeral mask for live mask-handle drag (no undo / no session write). */
-export function previewMaskOverride(
-  trackId: string,
-  clipId: string,
-  mask: import("./types").ClipMask | null,
-  timeSecs: number,
-): Promise<void> {
-  return invoke("preview_mask_override", {
-    trackId,
-    clipId,
-    mask,
-    timeSecs,
-  });
 }
 
 // ---- Events ----
@@ -542,13 +498,3 @@ export function isWindowMaximized(): Promise<boolean> {
   return getCurrentWindow().isMaximized();
 }
 
-export function onWindowGeometryChange(cb: () => void): () => void {
-  const win = getCurrentWindow();
-  const unsubs: Array<() => void> = [];
-  void win.onResized(() => cb()).then((u) => unsubs.push(u));
-  void win.onMoved(() => cb()).then((u) => unsubs.push(u));
-  void win.onScaleChanged(() => cb()).then((u) => unsubs.push(u));
-  return () => {
-    for (const u of unsubs) u();
-  };
-}

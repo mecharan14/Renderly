@@ -49,12 +49,13 @@ item pass/fail. Failures that crash the app or freeze the window are blockers.
 - [ ] **Mask tool (M):** paused preview — drag to create rect (Shift=ellipse, Alt=from
       center); move/resize handles; inspector Enable / Invert / Feather / shape switch;
       undo after mouseup commit (live drag does not spam undo); play hides overlay;
-      Select (V) restores transform handles; Windows preview click-through still works
+      Select (V) restores transform handles
 - [ ] Audio denoise (afftdn) on an audio-track clip survives export
 - [ ] Templates apply via command; multicam angle switch changes active angle
-- [ ] **Linux Wayland:** native preview aligns to the letterboxed `#preview-host` rect;
-      transport/mask overlays stay clickable (click-through); resize realigns (may lag one
-      GTK frame); X11 session still works as before
+- [ ] **Linux (WebKitGTK):** preview canvas renders (WebGPU/WebCodecs support varies by
+      distro — see docs/preview-webview.md "Risks"); handle/mask overlays stay above the
+      canvas and clickable; resize realigns the canvas immediately (plain DOM, no
+      OS-composited surface to lag)
 
 ## Shortcuts quick check
 
